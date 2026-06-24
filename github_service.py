@@ -169,9 +169,26 @@ class GitHubService:
         return context
 
     def _filter_files(self, files: List[Dict]) -> List[Dict]:
+        """
+        Fix #15: use path-segment and suffix matching instead of plain substring
+        so a pattern like 'build' doesn't accidentally exclude 'src/turbobuild/x.py',
+        and '.png' doesn't exclude 'src/mappings.png2.ts'.
+        """
+        from pathlib import PurePosixPath
+
+        def _matches_pattern(path: str, pattern: str) -> bool:
+            p = PurePosixPath(path)
+            pattern = pattern.strip()
+            # Match exact segment, suffix, or file extension.
+            return (
+                pattern in p.parts                            # exact segment
+                or p.suffix == pattern                        # file extension (e.g. '.png')
+                or any(part == pattern for part in p.parts)  # full segment match
+            )
+
         return [
             f for f in files
-            if not any(p.strip() in f.get("path", "") for p in CONFIG.excluded_patterns)
+            if not any(_matches_pattern(f.get("path", ""), p) for p in CONFIG.excluded_patterns)
             and f.get("size", 0) <= CONFIG.max_file_size_bytes
         ]
 
@@ -216,13 +233,29 @@ class GitHubService:
         if strategy == "revert":
             return await self._revert_commit(owner, repo, commit_sha, branch)
         elif strategy == "force_push":
-            return await self._force_push_remove(owner, repo, commit_sha)
+            return await self._force_push_remove(owner, repo, commit_sha, branch)
         else:
             raise RollbackError(f"Unknown strategy: {strategy}")
 
     async def _revert_commit(self, owner, repo, commit_sha, branch="main") -> Dict[str, Any]:
+        """
+        Properly revert a single commit without touching commits stacked on top.
+
+        The old approach set tree = parent_of_A's snapshot, which nukes every
+        commit that landed after A. Instead we use GitHub's merge API to compute
+        a three-way-merge tree (equivalent to `git revert A`):
+
+          merge base  = A           (the commit being reverted)
+          ours        = HEAD        (may include later accepted commits)
+          theirs      = parent_of_A (state before A)
+
+        The resulting tree is HEAD with A's changes surgically removed.
+        If A's changes conflict with later commits, we abort and surface the
+        error instead of silently corrupting the branch.
+        """
         client = await self._get_client()
 
+        # ── 1. Get A and its parent ──────────────────────────────────────────
         try:
             r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits/{commit_sha}")
             r.raise_for_status()
@@ -233,13 +266,7 @@ class GitHubService:
         except httpx.HTTPStatusError as exc:
             raise RollbackError(f"Failed to fetch commit: {exc.response.status_code}") from exc
 
-        try:
-            r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits/{parent_sha}")
-            r.raise_for_status()
-            parent_tree_sha = r.json()["tree"]["sha"]
-        except httpx.HTTPStatusError as exc:
-            raise RollbackError(f"Failed to fetch parent tree: {exc.response.status_code}") from exc
-
+        # ── 2. Get current HEAD ──────────────────────────────────────────────
         try:
             r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}")
             r.raise_for_status()
@@ -247,23 +274,70 @@ class GitHubService:
         except httpx.HTTPStatusError as exc:
             raise RollbackError(f"Failed to fetch branch HEAD: {exc.response.status_code}") from exc
 
+        # ── 3. Compute the revert tree via a probe merge ─────────────────────
+        # Merge HEAD into parent_of_A. The resulting tree is HEAD with A's
+        # changes removed. If there are conflicts (A and a later commit touched
+        # the same lines), the merge API returns 409 and we abort safely.
+        try:
+            r = await client.post(
+                f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/merges",
+                json={
+                    "base":           parent_sha,
+                    "head":           head_sha,
+                    "commit_message": f"__gitguard_probe_{commit_sha[:7]}",
+                },
+            )
+            if r.status_code == 409:
+                raise RollbackError(
+                    f"Revert of {commit_sha[:7]} conflicts with later accepted commits. "
+                    "Automatic rollback aborted — please resolve manually to protect accepted changes."
+                )
+            if r.status_code == 204:
+                raise RollbackError(
+                    f"Branch is already at or before {commit_sha[:7]} — nothing to revert."
+                )
+            r.raise_for_status()
+            probe = r.json()
+            revert_tree_sha = probe["commit"]["tree"]["sha"]
+            probe_sha       = probe["sha"]
+        except RollbackError:
+            raise
+        except httpx.HTTPStatusError as exc:
+            raise RollbackError(
+                f"Failed to compute revert tree: {exc.response.status_code} — {exc.response.text[:200]}"
+            ) from exc
+
+        # ── 4. Reset the branch back to HEAD (clean up the probe commit) ─────
+        try:
+            await client.patch(
+                f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
+                json={"sha": head_sha, "force": True},
+            )
+        except Exception as exc:
+            logger.warning("Could not reset branch after probe merge for %s: %s", commit_sha[:7], exc)
+
+        # ── 5. Create the real revert commit parented onto HEAD ───────────────
         try:
             r = await client.post(
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits",
                 json={
                     "message": (
                         f"revert: rollback commit {commit_sha[:7]}\n\n"
-                        "This commit was automatically rejected and reverted by CommitGuardian."
+                        "This commit was automatically rejected and reverted by CommitGuardian.\n"
+                        "Later accepted commits on this branch are preserved."
                     ),
-                    "tree":    parent_tree_sha,
+                    "tree":    revert_tree_sha,
                     "parents": [head_sha],
                 },
             )
             r.raise_for_status()
             new_sha = r.json()["sha"]
         except httpx.HTTPStatusError as exc:
-            raise RollbackError(f"Failed to create revert commit: {exc.response.status_code} — {exc.response.text[:200]}") from exc
+            raise RollbackError(
+                f"Failed to create revert commit: {exc.response.status_code} — {exc.response.text[:200]}"
+            ) from exc
 
+        # ── 6. Advance the branch to the revert commit ───────────────────────
         try:
             r = await client.patch(
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
@@ -280,7 +354,12 @@ class GitHubService:
 
         return {"success": True, "strategy": "revert", "revert_sha": new_sha}
 
-    async def _force_push_remove(self, owner, repo, commit_sha) -> Dict[str, Any]:
+    async def _force_push_remove(self, owner, repo, commit_sha, branch: str = "main") -> Dict[str, Any]:
+        """
+        Fix #6: use the caller-supplied branch instead of fetching default_branch
+        from the API. Previously this silently rewrote the wrong branch when the
+        user monitored a non-default branch (e.g. 'develop').
+        """
         client = await self._get_client()
         try:
             r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits/{commit_sha}")
@@ -293,15 +372,8 @@ class GitHubService:
             raise RollbackError(f"Failed to fetch commit: {exc}") from exc
 
         try:
-            r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}")
-            r.raise_for_status()
-            default_branch = r.json().get("default_branch", "main")
-        except httpx.HTTPError as exc:
-            raise RollbackError(f"Failed to fetch repo: {exc}") from exc
-
-        try:
             r = await client.patch(
-                f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{default_branch}",
+                f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
                 json={"sha": parent_sha, "force": True},
             )
             r.raise_for_status()

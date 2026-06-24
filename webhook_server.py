@@ -8,13 +8,15 @@ Fixes in this version:
 """
 
 import asyncio
+import hmac as _hmac
 import json
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Request, status
+import httpx
+from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
 import database as db
@@ -23,6 +25,32 @@ from config import CONFIG, logger
 from github_service import GitHubService, GitHubServiceError, RollbackError, WebhookVerificationError
 from telegram_service import TelegramAPIError, telegram_service
 from timeout_worker import run_timeout_worker
+
+# Fix #21: track all in-flight background tasks so we can drain them on shutdown.
+_background_tasks: Set[asyncio.Task] = set()
+
+def _track_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return task
+
+
+# Fix #4: per-commit asyncio locks prevent the double-press / double-rollback race.
+# Locks are pruned after use to prevent unbounded dict growth on long-running servers.
+_review_locks: Dict[str, asyncio.Lock] = {}
+
+def _get_review_lock(commit_sha: str) -> asyncio.Lock:
+    if commit_sha not in _review_locks:
+        _review_locks[commit_sha] = asyncio.Lock()
+    return _review_locks[commit_sha]
+
+def _release_review_lock(commit_sha: str) -> None:
+    """Prune the lock entry once we're done with it to avoid unbounded growth."""
+    lock = _review_locks.get(commit_sha)
+    # Only remove if the lock is currently free (no other waiter holds it).
+    if lock is not None and not lock.locked():
+        _review_locks.pop(commit_sha, None)
 
 
 # ──────────────────────────────────────────────
@@ -33,13 +61,45 @@ from timeout_worker import run_timeout_worker
 async def lifespan(app: FastAPI):
     db.init_db()
     logger.info("Commit Guardian v5 starting — multi-user + timeout worker")
+    # Fix #19: auto-register the Telegram webhook so the bot survives redeployments.
+    await _register_telegram_webhook()
     cleanup_task = asyncio.create_task(_cleanup_loop())
     timeout_task = asyncio.create_task(run_timeout_worker())
     yield
     logger.info("Shutting down…")
     cleanup_task.cancel()
     timeout_task.cancel()
+    # Fix #21: drain in-flight commit-processing tasks before exit so no
+    # commit is left with a "🔄 Fetching…" message and no DB record.
+    if _background_tasks:
+        logger.info("Waiting for %d in-flight tasks to finish (max 30 s)…", len(_background_tasks))
+        await asyncio.wait(_background_tasks, timeout=30)
     await telegram_service.close()
+
+
+async def _register_telegram_webhook() -> None:
+    """Fix #19: call setWebhook at startup so the URL is always current."""
+    if not CONFIG.public_url or not CONFIG.telegram_bot_token:
+        logger.warning("Cannot register Telegram webhook — public_url or token not set")
+        return
+    url = f"{CONFIG.public_url}/webhook/telegram"
+    payload: Dict[str, Any] = {"url": url}
+    # Include the webhook secret if configured (fix #2 also relies on this).
+    if getattr(CONFIG, "telegram_webhook_secret", None):
+        payload["secret_token"] = CONFIG.telegram_webhook_secret
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                f"https://api.telegram.org/bot{CONFIG.telegram_bot_token}/setWebhook",
+                json=payload,
+            )
+            result = r.json()
+            if result.get("ok"):
+                logger.info("Telegram webhook registered: %s", url)
+            else:
+                logger.warning("Telegram webhook registration failed: %s", result)
+    except Exception as exc:
+        logger.warning("Could not register Telegram webhook: %s", exc)
 
 
 async def _cleanup_loop() -> None:
@@ -80,7 +140,6 @@ async def root():
 async def github_webhook(
     chat_id: str,
     request: Request,
-    background_tasks: BackgroundTasks,
     x_hub_signature_256: Optional[str] = Header(None),
     x_github_event:      Optional[str] = Header(None),
     x_github_delivery:   Optional[str] = Header(None),
@@ -127,13 +186,39 @@ async def github_webhook(
     )
 
     queued = 0
-    for c in commits:
+
+    # Fix #11: cap commits processed per push event to avoid Groq/GitHub/Telegram flooding.
+    # For large pushes (e.g. rebase of 50 commits), only process the head commit.
+    MAX_COMMITS_PER_PUSH = 3
+    if len(commits) > MAX_COMMITS_PER_PUSH:
+        logger.info(
+            "Push has %d commits — capping to head commit only (user %s)",
+            len(commits), chat_id,
+        )
+        commits_to_process = [commits[-1]]
+    else:
+        commits_to_process = commits[:MAX_COMMITS_PER_PUSH]
+
+    # Fix #18: cap pending reviews per user to prevent Telegram flood.
+    MAX_PENDING_PER_USER = 5
+    pending = db.get_active_reviews_for_user(chat_id)
+    if len(pending) >= MAX_PENDING_PER_USER:
+        logger.warning("User %s hit pending review cap (%d) — skipping push", chat_id, MAX_PENDING_PER_USER)
+        return {"status": "ignored", "reason": "too many pending reviews"}
+
+    for c in commits_to_process:
         sha = c.get("id")
-        if sha and not db.get_review(sha):
-            background_tasks.add_task(
-                process_commit, chat_id, user["github_token"],
-                owner, repo, sha,
-                pusher.get("name", "Unknown"), pusher.get("email", "N/A"), branch,
+        if not sha:
+            continue
+        # Fix #3: use an atomic DB insert as the dedup gate instead of
+        # read-then-write (which races on GitHub webhook retries).
+        if db.try_queue_sha(sha, chat_id):
+            _track_task(
+                process_commit(
+                    chat_id, user["github_token"],
+                    owner, repo, sha,
+                    pusher.get("name", "Unknown"), pusher.get("email", "N/A"), branch,
+                )
             )
             queued += 1
 
@@ -275,6 +360,12 @@ async def _process_commit_inner(
 
 @app.post("/webhook/telegram", status_code=status.HTTP_200_OK)
 async def telegram_webhook(request: Request):
+    # Fix #2: verify the Telegram secret token header before processing anything.
+    if getattr(CONFIG, "telegram_webhook_secret", None):
+        provided = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+        if not _hmac.compare_digest(provided, CONFIG.telegram_webhook_secret):
+            raise HTTPException(status_code=403, detail="Invalid Telegram webhook secret")
+
     try:
         update = await request.json()
     except Exception:
@@ -289,6 +380,10 @@ async def telegram_webhook(request: Request):
     if msg:
         chat_id = str(msg.get("chat", {}).get("id", ""))
         text    = msg.get("text", "").strip()
+
+        if text.lower() in ("/cancel", "/stop"):
+            await telegram_service.handle_cancel(chat_id)
+            return {"ok": True}
 
         if text.lower() in ("/start", "/setup"):
             await telegram_service.handle_start(chat_id)
@@ -430,39 +525,79 @@ async def _handle_callback(callback_query: Dict[str, Any]) -> None:
 
     gh = GitHubService(token=user["github_token"])
 
-    try:
-        if action == "accept":
-            async def on_accept() -> None:
-                # Resolve first — if Telegram edit fails after this, the
-                # DB is still correct and buttons won't work again
-                db.resolve_review(commit_sha, "accepted")
-
-            await telegram_service.handle_accept(
-                chat_id, cq_id, message_id, commit_metadata, decision, on_accept
+    # Fix #4: acquire a per-commit lock before reading resolved state and acting.
+    # This serialises concurrent taps (double-tap on mobile, network retry) so
+    # the resolved check → action sequence is atomic within this process.
+    async with _get_review_lock(commit_sha):
+        # Re-read review inside the lock — another coroutine may have resolved it
+        # between the outer check and lock acquisition.
+        review = db.get_review(commit_sha)
+        if not review or review.get("resolved"):
+            await telegram_service.answer_callback(
+                cq_id,
+                "This review was already resolved — no action taken.",
+                show_alert=True,
             )
+            await gh.close()
+            return
 
-        elif action == "decline":
-            async def on_decline() -> Dict[str, Any]:
-                try:
-                    result = await gh.rollback_commit(
-                        review["owner"], review["repo"], commit_sha, branch=review["branch"]
+        try:
+            if action == "accept":
+                async def on_accept() -> None:
+                    db.resolve_review(commit_sha, "accepted")
+
+                await telegram_service.handle_accept(
+                    chat_id, cq_id, message_id, commit_metadata, decision, on_accept
+                )
+
+            elif action == "decline":
+                # Guard: check if any later commits were already accepted on this branch.
+                # Declining A when B (accepted) is stacked on top would wipe B's changes
+                # even with the improved revert logic, if there are file conflicts.
+                # Warn the user explicitly so they can make an informed decision.
+                review_created_at = review.get("created_at", "")
+                accepted_on_top = db.get_accepted_reviews_after(chat_id, review_created_at)
+                if accepted_on_top:
+                    shas = ", ".join(f"`{r['commit_sha'][:7]}`" for r in accepted_on_top[:3])
+                    await telegram_service.answer_callback(
+                        cq_id,
+                        f"⚠️ Accepted commits exist on top ({shas}). "
+                        "Rollback may conflict — see chat for details.",
+                        show_alert=True,
                     )
-                    return result
-                finally:
-                    # Always mark resolved regardless of rollback outcome
-                    # so buttons are disabled and user gets the result message
-                    db.resolve_review(commit_sha, "declined")
+                    await telegram_service.send_message(
+                        chat_id,
+                        f"⚠️ *Stacked Commit Warning*\n\n"
+                        f"You're declining `{commit_sha[:7]}` but the following commits "
+                        f"were already accepted on top of it:\n\n"
+                        + "\n".join(f"• `{r['commit_sha'][:7]}` — {r.get('status','accepted')}" for r in accepted_on_top[:5])
+                        + f"\n\nRollback will attempt a safe surgical revert. "
+                        f"If there are conflicts, it will abort automatically rather than "
+                        f"wipe the accepted commits. Proceeding…",
+                    )
 
-            await telegram_service.handle_decline(
-                chat_id, cq_id, message_id, commit_metadata, decision, on_decline
-            )
+                async def on_decline() -> Dict[str, Any]:
+                    try:
+                        result = await gh.rollback_commit(
+                            review["owner"], review["repo"], commit_sha, branch=review["branch"]
+                        )
+                        return result
+                    finally:
+                        db.resolve_review(commit_sha, "declined")
 
-        elif action == "report":
-            # Report doesn't resolve — user can still Accept/Decline after
-            await telegram_service.handle_report(chat_id, cq_id, commit_metadata, decision)
+                await telegram_service.handle_decline(
+                    chat_id, cq_id, message_id, commit_metadata, decision, on_decline
+                )
 
-    finally:
-        await gh.close()
+            elif action == "report":
+                # Report doesn't resolve — user can still Accept/Decline after
+                await telegram_service.handle_report(chat_id, cq_id, commit_metadata, decision)
+
+        finally:
+            await gh.close()
+
+    # Prune the lock entry now that we're done — prevents unbounded dict growth.
+    _release_review_lock(commit_sha)
 
 
 # ──────────────────────────────────────────────

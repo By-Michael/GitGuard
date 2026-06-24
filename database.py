@@ -79,8 +79,34 @@ def init_db() -> None:
 
         CREATE INDEX IF NOT EXISTS idx_reviews_chat
             ON active_reviews(chat_id, resolved);
+
+        -- Fix #3: atomic dedup gate prevents duplicate reviews on webhook retry.
+        -- Only the coroutine whose INSERT actually changes a row gets to queue
+        -- the background task; subsequent inserts for the same SHA are no-ops.
+        CREATE TABLE IF NOT EXISTS queued_shas (
+            sha        TEXT PRIMARY KEY,
+            chat_id    TEXT NOT NULL,
+            queued_at  TEXT DEFAULT (datetime('now'))
+        );
     """)
     conn.commit()
+
+
+def try_queue_sha(sha: str, chat_id: str) -> bool:
+    """
+    Atomically claim a commit SHA for processing.
+
+    Fix #3 (dedup race condition): INSERT OR IGNORE is atomic at the SQLite
+    level; only the first caller for a given SHA gets rowcount == 1.
+    Any concurrent or retried webhook delivery for the same SHA gets 0 and
+    should NOT queue a background task.
+    """
+    cur = _get_conn().execute(
+        "INSERT OR IGNORE INTO queued_shas (sha, chat_id) VALUES (?, ?)",
+        (sha, chat_id),
+    )
+    _get_conn().commit()
+    return cur.rowcount == 1
 
 
 # ── User CRUD ─────────────────────────────────────────────────────────────────
@@ -196,6 +222,24 @@ def resolve_review(commit_sha: str, status: str) -> None:
     _get_conn().commit()
 
 
+def get_accepted_reviews_after(chat_id: str, created_at: str) -> List[Dict[str, Any]]:
+    """
+    Return reviews for this user that were ACCEPTED and created AFTER the given
+    timestamp. Used to detect commits stacked on top of a commit being declined —
+    declining the older commit would also wipe the newer accepted ones.
+    """
+    rows = _get_conn().execute(
+        """SELECT * FROM active_reviews
+           WHERE chat_id = ?
+             AND status = 'accepted'
+             AND resolved = 1
+             AND created_at > ?
+           ORDER BY created_at ASC""",
+        (chat_id, created_at),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_active_reviews_for_user(chat_id: str) -> List[Dict[str, Any]]:
     rows = _get_conn().execute(
         """SELECT * FROM active_reviews
@@ -239,10 +283,13 @@ def mark_timed_out(commit_sha: str) -> None:
 
 
 def cleanup_old_reviews(hours: int = 48) -> int:
+    # Fix #7: use SQLite datetime modifier syntax with a bound parameter
+    # so the hours value can never be injected as raw SQL.
     cur = _get_conn().execute(
-        f"""DELETE FROM active_reviews
-            WHERE resolved = 1
-            AND created_at < datetime('now', '-{hours} hours')"""
+        "DELETE FROM active_reviews "
+        "WHERE resolved = 1 "
+        "AND created_at < datetime('now', ? || ' hours')",
+        (f"-{int(hours)}",),
     )
     _get_conn().commit()
     return cur.rowcount

@@ -4,7 +4,9 @@ Performs contextual risk assessment of GitHub commits with full project awarenes
 Provides transparent, explainable decisions with detailed reporting.
 """
 
+import asyncio
 import json
+import os
 import textwrap
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
@@ -66,13 +68,24 @@ class AIService:
 
     GROQ_API_BASE = "https://api.groq.com/openai/v1"
 
+    # Fix #8: cap concurrent Groq calls to avoid hitting rate limits when many
+    # users push simultaneously.
+    _semaphore = asyncio.Semaphore(5)
+
     def __init__(self) -> None:
         self.api_key = CONFIG.groq_api_key
         self.model = CONFIG.groq_model
         self.max_tokens = CONFIG.groq_max_tokens
         self.temperature = CONFIG.groq_temperature
-        self.headers = {
-            "Authorization": f"Bearer {self.api_key}",
+
+    def _get_headers(self) -> Dict[str, str]:
+        """
+        Fix #24: re-read the key from the environment on every request so a
+        rotated key takes effect without restarting the server.
+        """
+        key = os.getenv("GROQ_API_KEY", self.api_key)
+        return {
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
 
@@ -229,29 +242,46 @@ class AIService:
             len(system_prompt) + len(user_prompt),
         )
 
-        try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    f"{self.GROQ_API_BASE}/chat/completions",
-                    headers=self.headers,
-                    json=payload,
-                )
-                response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            error_detail = ""
-            try:
-                err_json = exc.response.json()
-                if isinstance(err_json, dict):
-                    error_detail = err_json.get("error", {}).get("message", exc.response.text)
-                else:
-                    error_detail = exc.response.text[:500]
-            except Exception:
-                error_detail = exc.response.text[:500]
-            raise AIAnalysisError(
-                f"Groq API error (HTTP {exc.response.status_code}): {error_detail}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise AIAnalysisError(f"Network error connecting to Groq API: {exc}") from exc
+        # Fix #8: limit concurrent Groq calls and retry on 429 with exponential backoff.
+        # Only 429 (rate limit) is retried — all other HTTP errors fail immediately.
+        async with self._semaphore:
+            for attempt in range(3):
+                try:
+                    async with httpx.AsyncClient(timeout=120.0) as client:
+                        response = await client.post(
+                            f"{self.GROQ_API_BASE}/chat/completions",
+                            headers=self._get_headers(),
+                            json=payload,
+                        )
+                        if response.status_code == 429:
+                            if attempt == 2:
+                                raise AIAnalysisError("Groq API rate limit exceeded after 3 attempts")
+                            wait = 2 ** attempt
+                            logger.warning(
+                                "Groq rate-limited (attempt %d/3) — retrying in %ds", attempt + 1, wait
+                            )
+                            await asyncio.sleep(wait)
+                            continue
+                        # Any non-429 HTTP error fails immediately — no retry.
+                        response.raise_for_status()
+                        break  # success
+                except httpx.HTTPStatusError as exc:
+                    error_detail = ""
+                    try:
+                        err_json = exc.response.json()
+                        if isinstance(err_json, dict):
+                            error_detail = err_json.get("error", {}).get("message", exc.response.text)
+                        else:
+                            error_detail = exc.response.text[:500]
+                    except Exception:
+                        error_detail = exc.response.text[:500]
+                    raise AIAnalysisError(
+                        f"Groq API error (HTTP {exc.response.status_code}): {error_detail}"
+                    ) from exc
+                except httpx.RequestError as exc:
+                    if attempt == 2:
+                        raise AIAnalysisError(f"Network error connecting to Groq API: {exc}") from exc
+                    await asyncio.sleep(2 ** attempt)
 
         # Parse response
         try:
@@ -369,7 +399,7 @@ class AIService:
             async with httpx.AsyncClient(timeout=120.0) as client:
                 response = await client.post(
                     f"{self.GROQ_API_BASE}/chat/completions",
-                    headers=self.headers,
+                    headers=self._get_headers(),
                     json={
                         "model": self.model,
                         "messages": [

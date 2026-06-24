@@ -79,6 +79,16 @@ class TelegramService:
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
+    def _safe_error(self, exc: Exception) -> str:
+        """
+        Fix #12: strip anything that looks like a GitHub token from exception
+        messages before they are sent to the user's Telegram chat.
+        """
+        msg = str(exc)
+        msg = re.sub(r"(ghp_|github_pat_)[A-Za-z0-9_]+", "[REDACTED]", msg)
+        msg = re.sub(r"token [A-Za-z0-9_]{10,}", "token [REDACTED]", msg)
+        return msg[:300]
+
     def _risk_emoji(self, risk_level: str) -> str:
         return {
             "critical": self.EMOJI["risk_critical"],
@@ -140,7 +150,18 @@ class TelegramService:
             payload["reply_markup"] = json.dumps(reply_markup)
         try:
             client = await self._get_client()
-            await client.post(f"{self.base_url}/editMessageText", json=payload)
+            r = await client.post(f"{self.base_url}/editMessageText", json=payload)
+            # Fix #23: if the original card was deleted by the user, fall back to
+            # sending a fresh message so the outcome is never silently lost.
+            if r.status_code == 400:
+                body = r.json()
+                desc = body.get("description", "").lower()
+                if "message to edit not found" in desc or "message_id_invalid" in desc:
+                    logger.warning(
+                        "Message %d not found for chat %s — sending fallback message",
+                        message_id, chat_id,
+                    )
+                    await self.send_message(chat_id, text, reply_markup=reply_markup)
         except httpx.HTTPError as exc:
             logger.warning("Could not edit message %d: %s", message_id, exc)
 
@@ -190,7 +211,33 @@ class TelegramService:
 
     # ── Onboarding wizard (5 steps) ───────────────────────────────────────────
 
+    async def handle_cancel(self, chat_id: str) -> None:
+        """Fix #22: escape hatch — lets user abort onboarding at any step."""
+        user = db.get_user(chat_id)
+        if user and user.get("onboard_step") not in (None, "done"):
+            db.upsert_user(chat_id, onboard_step="done")
+            await self.send_message(chat_id, "Setup cancelled. Send /start to begin again.")
+        else:
+            await self.send_message(chat_id, "Nothing to cancel. Send /start to configure.")
+
     async def handle_start(self, chat_id: str) -> None:
+        # Fix #9: warn the user if they have pending reviews before wiping config.
+        user = db.get_user(chat_id)
+        if user and db.get_active_reviews_for_user(chat_id):
+            db.upsert_user(chat_id, onboard_step="await_restart_confirm")
+            await self.send_message(
+                chat_id,
+                f"{self.EMOJI['warning']} *You have pending reviews.*\n\n"
+                "Reconfiguring now will clear your GitHub token and break any "
+                "auto-rollbacks for those reviews.\n\n"
+                "Send `CONFIRM` to proceed, or /status to review them first.",
+            )
+            return
+
+        await self._do_start(chat_id)
+
+    async def _do_start(self, chat_id: str) -> None:
+        """Actually reset config and start the onboarding wizard."""
         db.upsert_user(
             chat_id,
             onboard_step="await_repo",
@@ -218,6 +265,23 @@ class TelegramService:
         if step == "done":
             return False
 
+        # Fix #22: /cancel is an escape hatch at any onboarding step.
+        if text.strip().lower() in ("/cancel", "/stop", "cancel"):
+            await self.handle_cancel(chat_id)
+            return True
+
+        # Fix #9: user confirmed they want to reconfigure despite pending reviews.
+        if step == "await_restart_confirm":
+            if text.strip().upper() == "CONFIRM":
+                await self._do_start(chat_id)
+            else:
+                await self.send_message(
+                    chat_id,
+                    f"{self.EMOJI['warning']} Send `CONFIRM` to proceed with reconfiguration, "
+                    "or /status to see your pending reviews.",
+                )
+            return True
+
         # ── Step 1: repo ──────────────────────────────────────────────────────
         if step == "await_repo":
             if "/" not in text or text.count("/") != 1:
@@ -228,7 +292,19 @@ class TelegramService:
                 )
                 return True
             owner, repo = text.strip().split("/", 1)
-            db.upsert_user(chat_id, owner=owner.strip(), repo=repo.strip(), onboard_step="await_branch")
+            owner = owner.strip()
+            repo  = repo.strip()
+            # Fix #14: enforce GitHub's allowed character set so malformed values
+            # are never stored in the DB.
+            _GITHUB_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
+            if not _GITHUB_NAME_RE.match(owner) or not _GITHUB_NAME_RE.match(repo):
+                await self.send_message(
+                    chat_id,
+                    f"{self.EMOJI['warning']} Invalid format — use only letters, numbers, "
+                    "hyphens, dots, or underscores (max 100 chars each).\nTry again:",
+                )
+                return True
+            db.upsert_user(chat_id, owner=owner, repo=repo, onboard_step="await_branch")
             await self.send_message(
                 chat_id,
                 f"{self.EMOJI['check']} Repo: `{owner}/{repo}`\n\n"
@@ -271,10 +347,21 @@ class TelegramService:
                     "(should start with `ghp_` or `github_pat_`).\nTry again:",
                 )
                 return True
+            # Fix #16: validate token immediately with a live GitHub API call so
+            # truncated / expired / revoked tokens are caught during onboarding.
+            valid, username = await self._validate_github_token(token)
+            if not valid:
+                await self.send_message(
+                    chat_id,
+                    f"{self.EMOJI['warning']} Token invalid or expired — GitHub returned an error.\n"
+                    "Please generate a new one and paste it here:",
+                )
+                return True
             db.upsert_user(chat_id, github_token=token, onboard_step="await_timeout_hours")
+            greeting = f" (logged in as `{username}`)" if username else ""
             await self.send_message(
                 chat_id,
-                f"{self.EMOJI['check']} Token saved.\n\n"
+                f"{self.EMOJI['check']} Token verified{greeting}.\n\n"
                 f"{self.EMOJI['timeout']} *Step 4 of 5 — Review Timeout*\n\n"
                 "If you don't respond to a review, how many hours before I auto-act?\n\n"
                 "Common choices:\n"
@@ -333,6 +420,24 @@ class TelegramService:
             return True
 
         return False
+
+    async def _validate_github_token(self, token: str) -> tuple:
+        """
+        Fix #16: call the GitHub /user endpoint to verify the token is live.
+        Returns (True, login_username) or (False, "").
+        """
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                r = await client.get(
+                    "https://api.github.com/user",
+                    headers={"Authorization": f"token {token}", "User-Agent": "CommitGuardian/2.0"},
+                )
+                if r.status_code == 200:
+                    return True, r.json().get("login", "")
+                return False, ""
+        except Exception as exc:
+            logger.warning("GitHub token validation request failed: %s", exc)
+            return False, ""
 
     async def _finish_onboarding(self, chat_id: str) -> None:
         user           = db.get_user(chat_id)
@@ -585,7 +690,7 @@ class TelegramService:
             await self.delete_message(chat_id, proc)
             await self.send_message(
                 chat_id,
-                f"⚠️ *Report Error*\n\n`{exc}`\n\n"
+                f"⚠️ *Report Error*\n\n`{self._safe_error(exc)}`\n\n"
                 f"*Basic:* {decision.decision.upper()} | {decision.risk_level.upper()} | "
                 f"{decision.confidence_score:.0%}\n\n{decision.summary}",
             )
@@ -756,9 +861,15 @@ class TelegramService:
                 body(line)
 
         # ── Save ──────────────────────────────────────────────────────────────
+        import contextlib
         fd, out_path = tempfile.mkstemp(suffix=".docx")
         os.close(fd)
-        doc.save(out_path)
+        try:
+            doc.save(out_path)
+        except Exception:
+            with contextlib.suppress(OSError):
+                os.unlink(out_path)
+            raise  # re-raise so _build_report_docx / handle_report catches it
         return out_path
 
 
