@@ -435,5 +435,288 @@ class AIService:
             )
 
 
+    # ── Full codebase analysis ─────────────────────────────────────────────────
+
+    async def analyze_full_codebase(
+        self,
+        repo_context: Dict[str, Any],
+        reviews: List[Dict[str, Any]],
+    ) -> Dict[str, Any]:
+        """
+        Analyse the entire codebase for security, quality, and progress.
+        Accepts a repo_context dict and all historical review records.
+        Returns a structured dict with sections ready for docx generation.
+
+        Token-budget strategy:
+        - File tree: max 200 paths, each trimmed to basename for structure overview
+        - File contents: up to 10 files, 1 500 chars each (already pre-trimmed by fetch_repo_context)
+        - Review history: last 30 entries, decision + risk only (no raw diffs)
+        - README: 3 000 chars max
+        """
+
+        # -- summarise historical reviews with tiny footprint --
+        review_summary_lines: List[str] = []
+        for r in (reviews or [])[-30:]:
+            try:
+                dec = json.loads(r.get("decision_json") or "{}")
+            except Exception:
+                dec = {}
+            review_summary_lines.append(
+                f"SHA:{(r.get('commit_sha') or '')[:7]} "
+                f"status:{r.get('status','?')} "
+                f"risk:{dec.get('risk_level','?')} "
+                f"decision:{dec.get('decision','?')}"
+            )
+
+        # -- build compact file-tree (paths only, max 200) --
+        tree_snippet = "\n".join((repo_context.get("tree") or [])[:200])
+
+        # -- key file contents (already ≤8 000 chars each, take 10 files at 1 500 chars) --
+        files_snippet_parts: List[str] = []
+        for fd in (repo_context.get("files") or [])[:10]:
+            content = (fd.get("content") or "")[:1500]
+            files_snippet_parts.append(f"=== {fd.get('path','?')} ===\n{content}")
+        files_snippet = "\n\n".join(files_snippet_parts)
+
+        readme_snippet = (repo_context.get("readme") or "")[:3000]
+
+        prompt = textwrap.dedent(f"""\
+            You are auditing a software project. Respond ONLY with a JSON object using
+            the exact schema below — no markdown, no preamble.
+
+            REPOSITORY: {repo_context.get('repository','N/A')}
+            LANGUAGE: {repo_context.get('language','N/A')}
+            DESCRIPTION: {repo_context.get('description') or 'N/A'}
+            TOPICS: {', '.join(repo_context.get('topics',[]))}
+
+            FILE TREE (up to 200 paths):
+            {tree_snippet}
+
+            KEY FILE CONTENTS (up to 10 files, 1500 chars each):
+            {files_snippet}
+
+            README (first 3000 chars):
+            {readme_snippet}
+
+            COMMIT REVIEW HISTORY (last 30 commits — status / risk / decision only):
+            {chr(10).join(review_summary_lines) or 'No history yet.'}
+
+            Produce a JSON object with these exact keys:
+            {{
+              "overall_health": "excellent|good|fair|poor|critical",
+              "security": {{
+                "score": 0-100,
+                "summary": "2-3 sentence overview",
+                "findings": ["finding 1", ...],
+                "recommendations": ["rec 1", ...]
+              }},
+              "code_quality": {{
+                "score": 0-100,
+                "summary": "2-3 sentence overview",
+                "strengths": ["...", ...],
+                "weaknesses": ["...", ...]
+              }},
+              "architecture": {{
+                "summary": "2-3 sentence overview",
+                "patterns_detected": ["...", ...],
+                "concerns": ["...", ...]
+              }},
+              "progress": {{
+                "summary": "2-3 sentence overview",
+                "total_commits_reviewed": <int>,
+                "accepted": <int>,
+                "declined": <int>,
+                "pending": <int>,
+                "high_risk_commits": <int>,
+                "trend": "improving|stable|declining|insufficient_data"
+              }},
+              "dependencies": {{
+                "summary": "1-2 sentences",
+                "notable": ["...", ...]
+              }},
+              "executive_summary": "3-5 sentence non-technical overview for management",
+              "top_recommendations": ["priority rec 1", "priority rec 2", "priority rec 3"]
+            }}
+        """)
+
+        try:
+            async with self._semaphore:
+                async with httpx.AsyncClient(timeout=120.0) as client:
+                    response = await client.post(
+                        f"{self.GROQ_API_BASE}/chat/completions",
+                        headers=self._get_headers(),
+                        json={
+                            "model": self.model,
+                            "messages": [
+                                {"role": "system", "content": "You are a senior software auditor. Always respond with valid JSON only, no markdown."},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "max_tokens": 2000,
+                            "temperature": 0.2,
+                            "response_format": {"type": "json_object"},
+                        },
+                    )
+                    response.raise_for_status()
+            raw = response.json()["choices"][0]["message"]["content"]
+            result = json.loads(raw)
+            logger.info("Full codebase analysis complete — health: %s", result.get("overall_health"))
+            return result
+        except Exception as exc:
+            logger.error("Full codebase analysis failed: %s", exc)
+            raise AIAnalysisError(f"Codebase analysis failed: {exc}") from exc
+
+    # ── Author performance analysis ────────────────────────────────────────────
+
+    async def analyze_authors(
+        self,
+        reviews: List[Dict[str, Any]],
+        repo_name: str,
+    ) -> Dict[str, Any]:
+        """
+        Analyse per-author commit quality from stored review records.
+        Builds minimal summary per author (no raw code) to stay within token limits.
+        Returns structured dict ready for docx generation.
+        """
+        from collections import defaultdict
+
+        # -- aggregate per-author stats locally (no extra API calls needed) --
+        stats: Dict[str, Dict] = defaultdict(lambda: {
+            "total": 0, "accepted": 0, "declined": 0, "pending": 0,
+            "high_risk": 0, "critical_risk": 0, "low_risk": 0,
+            "concerns_sample": [], "positives_sample": [],
+            "messages": [],
+        })
+
+        for r in reviews:
+            try:
+                meta = json.loads(r.get("commit_meta_json") or "{}")
+                dec  = json.loads(r.get("decision_json") or "{}")
+            except Exception:
+                continue
+            name   = meta.get("author_name") or meta.get("_pusher_name") or "Unknown"
+            email  = meta.get("author_email") or ""
+            author_key = f"{name} <{email}>" if email else name
+
+            s = stats[author_key]
+            s["total"] += 1
+            status = r.get("status", "pending")
+            if status == "accepted":
+                s["accepted"] += 1
+            elif status == "declined":
+                s["declined"] += 1
+            else:
+                s["pending"] += 1
+
+            risk = (dec.get("risk_level") or "").lower()
+            if risk in ("high", "critical"):
+                s["high_risk"] += 1
+            if risk == "critical":
+                s["critical_risk"] += 1
+            if risk == "low":
+                s["low_risk"] += 1
+
+            # sample at most 3 concerns and 3 positives per author
+            for c in (dec.get("concerns") or [])[:2]:
+                if len(s["concerns_sample"]) < 6:
+                    s["concerns_sample"].append(c)
+            for p in (dec.get("positive_aspects") or [])[:2]:
+                if len(s["positives_sample"]) < 6:
+                    s["positives_sample"].append(p)
+
+            msg = (meta.get("message") or "")[:80]
+            if len(s["messages"]) < 5:
+                s["messages"].append(msg)
+
+        if not stats:
+            return {
+                "repo": repo_name,
+                "authors": [],
+                "team_summary": "No commit history found to analyse.",
+                "mvp": None,
+                "needs_attention": None,
+            }
+
+        # -- build compact prompt --
+        author_lines: List[str] = []
+        for author, s in stats.items():
+            decline_rate = round(s["declined"] / s["total"] * 100) if s["total"] else 0
+            author_lines.append(
+                f"AUTHOR: {author}\n"
+                f"  total={s['total']} accepted={s['accepted']} declined={s['declined']} pending={s['pending']}\n"
+                f"  high_risk_commits={s['high_risk']} critical={s['critical_risk']} low_risk={s['low_risk']}\n"
+                f"  decline_rate={decline_rate}%\n"
+                f"  concern_samples={s['concerns_sample'][:3]}\n"
+                f"  positive_samples={s['positives_sample'][:3]}\n"
+                f"  recent_messages={s['messages'][:3]}"
+            )
+
+        prompt = textwrap.dedent(f"""\
+            You are evaluating developer performance based on commit review data for repo: {repo_name}.
+            Respond ONLY with a JSON object using the exact schema below.
+
+            RAW STATS PER AUTHOR:
+            {chr(10).join(author_lines)}
+
+            Produce a JSON object:
+            {{
+              "repo": "{repo_name}",
+              "team_summary": "2-3 sentence team-wide overview",
+              "mvp": "author name of top performer (or null)",
+              "needs_attention": "author name who needs most improvement (or null)",
+              "authors": [
+                {{
+                  "name": "Full Name <email>",
+                  "total_commits": <int>,
+                  "accepted": <int>,
+                  "declined": <int>,
+                  "pending": <int>,
+                  "high_risk_commits": <int>,
+                  "decline_rate_pct": <int>,
+                  "performance_rating": "excellent|good|average|below_average|poor",
+                  "strengths": ["...", ...],
+                  "concerns": ["...", ...],
+                  "verdict": "1-2 sentence honest assessment"
+                }},
+                ...
+              ]
+            }}
+
+            Rules:
+            - Be honest and specific — this is an internal team review.
+            - performance_rating should reflect decline_rate AND commit quality signals.
+            - A high decline_rate (>40%) = at minimum 'below_average'.
+            - Authors with 0 declined commits and good quality signals = 'excellent' or 'good'.
+            - Include ALL authors from the stats above.
+        """)
+
+        try:
+            async with self._semaphore:
+                async with httpx.AsyncClient(timeout=90.0) as client:
+                    response = await client.post(
+                        f"{self.GROQ_API_BASE}/chat/completions",
+                        headers=self._get_headers(),
+                        json={
+                            "model": self.model,
+                            "messages": [
+                                {"role": "system", "content": "You are a senior engineering manager. Respond with valid JSON only, no markdown."},
+                                {"role": "user", "content": prompt},
+                            ],
+                            "max_tokens": 2000,
+                            "temperature": 0.2,
+                            "response_format": {"type": "json_object"},
+                        },
+                    )
+                    response.raise_for_status()
+            raw = response.json()["choices"][0]["message"]["content"]
+            result = json.loads(raw)
+            # Attach local raw stats for the docx builder to use
+            result["_raw_stats"] = dict(stats)
+            logger.info("Author analysis complete — %d authors", len(result.get("authors", [])))
+            return result
+        except Exception as exc:
+            logger.error("Author analysis failed: %s", exc)
+            raise AIAnalysisError(f"Author analysis failed: {exc}") from exc
+
+
 # Singleton instance
 ai_service = AIService()

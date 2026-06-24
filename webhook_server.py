@@ -418,8 +418,29 @@ async def telegram_webhook(request: Request):
             await _handle_help(chat_id)
             return {"ok": True}
 
-        # Mid-onboarding message
-        await telegram_service.handle_message(chat_id, text)
+        if text.lower() == "/menu":
+            await telegram_service.show_main_menu(chat_id)
+            return {"ok": True}
+
+        # Mid-onboarding message — consumes input if a wizard step is active
+        consumed = await telegram_service.handle_message(chat_id, text)
+
+        if not consumed:
+            # Route reply-keyboard button presses
+            if text == "👤 My Profile":
+                await telegram_service.handle_my_profile(chat_id)
+            elif text == "📜 Commit History":
+                await telegram_service.handle_commit_history(chat_id)
+            elif text == "📊 Active Reviews":
+                await _handle_status(chat_id)
+            elif text == "⚙️ Settings":
+                await telegram_service.handle_settings(chat_id)
+            elif text == "🔍 Full Code Analysis":
+                await telegram_service.handle_full_code_analysis(chat_id)
+            elif text == "👥 Author Performance":
+                await telegram_service.handle_author_review(chat_id)
+            elif text == "📞 Contact Support":
+                await telegram_service.handle_contact_support(chat_id)
 
     return {"ok": True}
 
@@ -454,16 +475,26 @@ async def _handle_status(chat_id: str) -> None:
 async def _handle_help(chat_id: str) -> None:
     await telegram_service.send_message(
         chat_id,
-        "🤖 *Commit Guardian — Commands*\n\n"
-        "/start — Set up or reconfigure your repo\n"
-        "/reconnect — Refresh an expired/revoked GitHub token (keeps your settings)\n"
-        "/status — See your pending reviews\n"
-        "/settings — Change timeout settings\n"
-        "/help — This message\n\n"
+        "🤖 *Commit Guardian — Help*\n\n"
+        "📋 *Menu Buttons*\n"
+        "👤 My Profile — view & edit your credentials\n"
+        "📜 Commit History — see all past reviews & AI decisions\n"
+        "📊 Active Reviews — view commits waiting for your action\n"
+        "⚙️ Settings — change timeout behaviour\n"
+        "🔍 Full Code Analysis — AI audit of your entire codebase (security, quality, progress)\n"
+        "👥 Author Performance — per-developer commit quality report\n"
+        "📞 Contact Support — reach our support team\n\n"
+        "📟 *Commands*\n"
+        "/menu — show the menu keyboard\n"
+        "/start — set up or reconfigure your repo\n"
+        "/reconnect — refresh an expired GitHub token\n"
+        "/status — see your pending reviews\n"
+        "/settings — change timeout settings\n"
+        "/help — this message\n\n"
         "*How it works:*\n"
-        "1. You set up your repo via /start\n"
+        "1. Set up your repo via /start\n"
         "2. Every push triggers an AI review\n"
-        "3. You Accept, Decline (rollback), or request a Report\n"
+        "3. You Accept, Decline (rollback), or request a Transparency Report\n"
         "4. If you don't respond within your timeout, I auto-act",
     )
 
@@ -487,6 +518,28 @@ async def _handle_callback(callback_query: Dict[str, Any]) -> None:
                 chat_id,
                 "⏰ *Change Timeout*\n\nHow many hours before I auto-act?\n_(Send `0` to disable)_",
             )
+        return
+
+    # ── Profile edit shortcuts ────────────────────────────────────────────────
+    if data_str.startswith("prof:"):
+        action = data_str.split(":", 1)[1]
+        await telegram_service.answer_callback(cq_id)
+        if action == "token":
+            await telegram_service.handle_reconnect(chat_id)
+        elif action == "branch":
+            db.upsert_user(chat_id, onboard_step="await_branch_update")
+            await telegram_service.send_message(
+                chat_id,
+                "🔀 *Change Branch*\n\nWhich branch should I monitor?\n_(Type name or send `main`)_",
+            )
+        elif action == "timeout":
+            db.upsert_user(chat_id, onboard_step="await_timeout_hours")
+            await telegram_service.send_message(
+                chat_id,
+                "⏰ *Change Timeout*\n\nHow many hours before I auto-act?\n_(Send `0` to disable)_",
+            )
+        elif action == "restart":
+            await telegram_service.handle_start(chat_id)
         return
 
     # ── Review button ─────────────────────────────────────────────────────────

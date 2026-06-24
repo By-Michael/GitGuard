@@ -240,6 +240,17 @@ def get_accepted_reviews_after(chat_id: str, created_at: str) -> List[Dict[str, 
     return [dict(r) for r in rows]
 
 
+def get_all_reviews_for_user(chat_id: str, limit: int = 20) -> List[Dict[str, Any]]:
+    """Return ALL reviews (resolved and pending) for commit history view."""
+    rows = _get_conn().execute(
+        """SELECT * FROM active_reviews
+           WHERE chat_id = ?
+           ORDER BY created_at DESC LIMIT ?""",
+        (chat_id, limit),
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
 def get_active_reviews_for_user(chat_id: str) -> List[Dict[str, Any]]:
     rows = _get_conn().execute(
         """SELECT * FROM active_reviews

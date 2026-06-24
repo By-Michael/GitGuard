@@ -60,6 +60,18 @@ class TelegramService:
         "timeout":       "⏰",
     }
 
+    # ── Persistent reply keyboard shown after setup and via /menu ─────────────
+    MAIN_MENU_KEYBOARD = {
+        "keyboard": [
+            [{"text": "👤 My Profile"}, {"text": "📜 Commit History"}],
+            [{"text": "📊 Active Reviews"}, {"text": "⚙️ Settings"}],
+            [{"text": "🔍 Full Code Analysis"}, {"text": "👥 Author Performance"}],
+            [{"text": "📞 Contact Support"}],
+        ],
+        "resize_keyboard": True,
+        "is_persistent": True,
+    }
+
     def __init__(self) -> None:
         self.token    = CONFIG.telegram_bot_token
         self.base_url = f"https://api.telegram.org/bot{self.token}"
@@ -208,6 +220,12 @@ class TelegramService:
             response.raise_for_status()
         except httpx.HTTPError as exc:
             raise TelegramAPIError(f"Failed to send document: {exc}") from exc
+
+    # ── Main menu ─────────────────────────────────────────────────────────────
+
+    async def show_main_menu(self, chat_id: str, text: str = "Choose an option:") -> None:
+        """Send (or re-send) the persistent reply keyboard."""
+        await self.send_message(chat_id, text, reply_markup=self.MAIN_MENU_KEYBOARD)
 
     # ── Onboarding wizard (5 steps) ───────────────────────────────────────────
 
@@ -472,6 +490,14 @@ class TelegramService:
             await self._finish_onboarding(chat_id)
             return True
 
+        # ── Branch-only update (from My Profile edit) ─────────────────────────
+        if step == "await_branch_update":
+            branch = text.strip() or "main"
+            db.upsert_user(chat_id, branch=branch, onboard_step="done")
+            await self.send_message(chat_id, f"{self.EMOJI['check']} Branch updated to `{branch}`.")
+            await self.handle_my_profile(chat_id)
+            return True
+
         return False
 
     async def _validate_github_token(self, token: str) -> tuple:
@@ -527,6 +553,7 @@ class TelegramService:
             f"⚠️ _Copy the secret above now and delete this message after saving it._\n\nEvery push to `{branch}` will now appear here for review. 🎉\n\n"
             f"_Commands: /status · /settings · /start (reconfigure)_",
         )
+        await self.show_main_menu(chat_id, "✅ Setup complete — use the menu below:")
 
     # ── /settings command ─────────────────────────────────────────────────────
 
@@ -561,6 +588,150 @@ class TelegramService:
             f"• Branch: `{user.get('branch','main')}`\n"
             f"• Timeout: {timeout_str}\n\n"
             f"Webhook URL:\n`{CONFIG.public_url}/webhook/github/{chat_id}`",
+            reply_markup=keyboard,
+        )
+
+    # ── My Profile ────────────────────────────────────────────────────────────
+
+    async def handle_my_profile(self, chat_id: str) -> None:
+        """Show full profile with masked token and inline edit buttons."""
+        user = db.get_user(chat_id)
+        if not user or not db.is_setup_complete(chat_id):
+            await self.send_message(
+                chat_id,
+                "👤 *My Profile*\n\n"
+                "You haven't completed setup yet. Send /start to configure your repo.",
+            )
+            return
+
+        token = user.get("github_token") or ""
+        if len(token) > 12:
+            masked_token = f"{token[:8]}...{token[-4:]}"
+        elif token:
+            masked_token = "****"
+        else:
+            masked_token = "_not set_"
+
+        timeout_hours  = user.get("timeout_hours", 24)
+        timeout_action = user.get("timeout_action", "accept")
+        if timeout_hours == 0 or timeout_action == "none":
+            timeout_str = "Disabled"
+        else:
+            timeout_str = f"Auto-{timeout_action} after {timeout_hours}h"
+
+        webhook_url = f"{CONFIG.public_url}/webhook/github/{chat_id}"
+        created_at  = (user.get("created_at") or "")[:10] or "N/A"
+
+        keyboard = {
+            "inline_keyboard": [
+                [
+                    {"text": "🔑 Refresh Token",    "callback_data": "prof:token"},
+                    {"text": "🔀 Change Branch",    "callback_data": "prof:branch"},
+                ],
+                [
+                    {"text": "⏰ Change Timeout",   "callback_data": "prof:timeout"},
+                    {"text": "🔄 Full Reconfigure", "callback_data": "prof:restart"},
+                ],
+            ]
+        }
+
+        await self.send_message(
+            chat_id,
+            f"👤 *My Profile*\n\n"
+            f"• {self.EMOJI['commit']} *Repository:* `{user.get('owner')}/{user.get('repo')}`\n"
+            f"• 🌿 *Branch:* `{user.get('branch', 'main')}`\n"
+            f"• {self.EMOJI['key']} *GitHub Token:* `{masked_token}`\n"
+            f"• {self.EMOJI['timeout']} *Timeout:* {timeout_str}\n"
+            f"• 📅 *Member since:* {created_at}\n\n"
+            f"🔗 *Webhook URL:*\n`{webhook_url}`\n\n"
+            f"_Use the buttons below to modify your settings:_",
+            reply_markup=keyboard,
+        )
+
+    # ── Commit History ────────────────────────────────────────────────────────
+
+    async def handle_commit_history(self, chat_id: str) -> None:
+        """Show paginated commit history with AI decisions."""
+        user = db.get_user(chat_id)
+        if not user or not db.is_setup_complete(chat_id):
+            await self.send_message(
+                chat_id,
+                "📜 *Commit History*\n\n"
+                "You haven't completed setup yet. Send /start to configure your repo.",
+            )
+            return
+
+        reviews = db.get_all_reviews_for_user(chat_id, limit=15)
+
+        if not reviews:
+            await self.send_message(
+                chat_id,
+                "📜 *Commit History*\n\n"
+                "_No commits reviewed yet._\n\n"
+                "Once you push to your repository, commit reviews will appear here.",
+            )
+            return
+
+        status_icon = {
+            "accepted": "✅",
+            "declined": "❌",
+            "pending":  "⏳",
+        }
+
+        lines: list = []
+        for i, r in enumerate(reviews, 1):
+            sha    = r["commit_sha"][:7]
+            status = r.get("status", "pending")
+            icon   = status_icon.get(status, "⏳")
+            date   = (r.get("created_at") or "")[:10]
+
+            # Pull commit message from stored metadata
+            try:
+                meta = json.loads(r.get("commit_meta_json") or "{}")
+            except Exception:
+                meta = {}
+            commit_msg = (meta.get("message") or "")[:55]
+
+            # Pull risk from stored decision
+            try:
+                dec = json.loads(r.get("decision_json") or "{}")
+            except Exception:
+                dec = {}
+            risk       = (dec.get("risk_level") or "").upper()
+            risk_emoji = self._risk_emoji(risk.lower()) if risk else ""
+
+            line = f"{i}. {icon} `{sha}` {risk_emoji} _{date}_ — *{status.capitalize()}*"
+            if commit_msg:
+                # Escape backtick to avoid markdown breakage
+                safe_msg = commit_msg.replace("`", "'")
+                line += f"\n    `{safe_msg}`"
+            lines.append(line)
+
+        header = f"📜 *Commit History* (last {len(reviews)})\n"
+        body   = "\n\n".join(lines)
+        text   = f"{header}Repo: `{user.get('owner')}/{user.get('repo')}`\n\n{body}"
+
+        if len(text) > 4000:
+            text = text[:4000] + "\n\n_…truncated_"
+
+        await self.send_message(chat_id, text)
+
+    # ── Contact Support ───────────────────────────────────────────────────────
+
+    async def handle_contact_support(self, chat_id: str) -> None:
+        """Send a message with a link to the support Telegram account."""
+        keyboard = {
+            "inline_keyboard": [
+                [{"text": "💬 Open Support Chat", "url": "https://t.me/nativered"}],
+            ]
+        }
+        await self.send_message(
+            chat_id,
+            "📞 *Contact Support*\n\n"
+            "Having trouble or need help with Commit Guardian?\n\n"
+            "Reach out to our support team directly on Telegram:\n"
+            "👉 @nativered\n\n"
+            "_Tap the button below to open a chat with us._",
             reply_markup=keyboard,
         )
 
@@ -747,6 +918,518 @@ class TelegramService:
                 f"*Basic:* {decision.decision.upper()} | {decision.risk_level.upper()} | "
                 f"{decision.confidence_score:.0%}\n\n{decision.summary}",
             )
+
+    # ── Full codebase analysis ─────────────────────────────────────────────────
+
+    async def handle_full_code_analysis(self, chat_id: str) -> None:
+        """
+        Triggered by the '🔍 Full Code Analysis' menu button.
+        Fetches repo context, sends everything to AI in one compact call,
+        then generates a structured .docx report and delivers it.
+        """
+        user = db.get_user(chat_id)
+        if not user or not db.is_setup_complete(chat_id):
+            await self.send_message(
+                chat_id,
+                "⚠️ Please complete setup first — send /start",
+            )
+            return
+
+        owner = user.get("owner", "")
+        repo  = user.get("repo", "")
+        proc  = await self.send_processing(
+            chat_id,
+            f"🔍 _Starting full code analysis for `{owner}/{repo}`…_\n\n"
+            "_This may take 30–60 seconds. Fetching codebase context…_",
+        )
+
+        try:
+            from github_service import GitHubService
+            gh = GitHubService(token=user["github_token"])
+
+            await self.edit_message(chat_id, proc, "🔍 _Loading repository structure and key files…_")
+            repo_context = await gh.fetch_repo_context(owner, repo, default_branch=user.get("branch", "main"))
+            await gh.close()
+
+            # All historical reviews for this user
+            reviews = db.get_all_reviews_for_user(chat_id, limit=200)
+
+            await self.edit_message(chat_id, proc, "🤖 _AI is auditing the entire codebase… (may take ~30s)_")
+            analysis = await ai_service.analyze_full_codebase(repo_context, reviews)
+
+            await self.edit_message(chat_id, proc, "📄 _Generating code analysis report…_")
+            docx_path = await self._build_code_analysis_docx(owner, repo, analysis, reviews)
+
+            await self.delete_message(chat_id, proc)
+            health = analysis.get("overall_health", "unknown").upper()
+            await self.send_document(
+                chat_id, docx_path,
+                caption=(
+                    f"🔍 *Full Code Analysis — `{owner}/{repo}`*\n\n"
+                    f"Overall Health: *{health}*\n"
+                    f"Security Score: *{analysis.get('security', {}).get('score', '?')}/100*\n"
+                    f"Quality Score: *{analysis.get('code_quality', {}).get('score', '?')}/100*\n\n"
+                    f"_Full report in the document above._"
+                ),
+                filename=f"code_analysis_{repo}.docx",
+            )
+            try:
+                os.unlink(docx_path)
+            except OSError:
+                pass
+
+        except Exception as exc:
+            logger.error("Full code analysis failed for %s: %s", chat_id, exc)
+            await self.delete_message(chat_id, proc)
+            await self.send_message(
+                chat_id,
+                f"⚠️ *Code Analysis Failed*\n\n`{self._safe_error(exc)}`\n\n"
+                "_Make sure your GitHub token has repo read access._",
+            )
+
+    async def handle_author_review(self, chat_id: str) -> None:
+        """
+        Triggered by the '👥 Author Performance Review' menu button.
+        Pulls all stored review records, aggregates per-author stats,
+        asks AI for qualitative assessment, then sends a .docx report.
+        No live GitHub API calls needed — uses the local DB only.
+        """
+        user = db.get_user(chat_id)
+        if not user or not db.is_setup_complete(chat_id):
+            await self.send_message(
+                chat_id,
+                "⚠️ Please complete setup first — send /start",
+            )
+            return
+
+        owner = user.get("owner", "")
+        repo  = user.get("repo", "")
+        proc  = await self.send_processing(
+            chat_id,
+            f"👥 _Analysing author performance for `{owner}/{repo}`…_",
+        )
+
+        try:
+            reviews = db.get_all_reviews_for_user(chat_id, limit=500)
+            if not reviews:
+                await self.delete_message(chat_id, proc)
+                await self.send_message(
+                    chat_id,
+                    "👥 *Author Performance Review*\n\n"
+                    "_No commit history found yet. Push some commits first!_",
+                )
+                return
+
+            await self.edit_message(chat_id, proc, "🤖 _AI is evaluating each author's track record…_")
+            analysis = await ai_service.analyze_authors(reviews, repo_name=f"{owner}/{repo}")
+
+            await self.edit_message(chat_id, proc, "📄 _Generating author performance report…_")
+            docx_path = await self._build_author_review_docx(owner, repo, analysis)
+
+            await self.delete_message(chat_id, proc)
+            n_authors = len(analysis.get("authors") or [])
+            mvp = analysis.get("mvp") or "N/A"
+            await self.send_document(
+                chat_id, docx_path,
+                caption=(
+                    f"👥 *Author Performance Review — `{owner}/{repo}`*\n\n"
+                    f"Authors analysed: *{n_authors}*\n"
+                    f"🏆 MVP: *{mvp}*\n\n"
+                    f"_Full breakdown in the document above._"
+                ),
+                filename=f"author_review_{repo}.docx",
+            )
+            try:
+                os.unlink(docx_path)
+            except OSError:
+                pass
+
+        except Exception as exc:
+            logger.error("Author review failed for %s: %s", chat_id, exc)
+            await self.delete_message(chat_id, proc)
+            await self.send_message(
+                chat_id,
+                f"⚠️ *Author Review Failed*\n\n`{self._safe_error(exc)}`",
+            )
+
+    # ── Code analysis docx builder ────────────────────────────────────────────
+
+    async def _build_code_analysis_docx(
+        self, owner: str, repo: str,
+        analysis: dict, reviews: list,
+    ) -> str:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._build_code_analysis_docx_sync(owner, repo, analysis, reviews),
+        )
+
+    def _build_code_analysis_docx_sync(
+        self, owner: str, repo: str, analysis: dict, reviews: list,
+    ) -> str:
+        from docx.oxml.ns import qn
+        from docx.oxml import OxmlElement
+
+        generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        BLUE      = RGBColor(0x1F, 0x49, 0x7D)
+        MID_BLUE  = RGBColor(0x2E, 0x75, 0xB6)
+        GREEN     = RGBColor(0x37, 0x86, 0x10)
+        RED       = RGBColor(0xC0, 0x00, 0x00)
+        ORANGE    = RGBColor(0xC5, 0x5A, 0x11)
+        YELLOW    = RGBColor(0xBF, 0x8F, 0x00)
+        GREY      = RGBColor(0x88, 0x88, 0x88)
+        BLACK     = RGBColor(0x00, 0x00, 0x00)
+
+        HEALTH_COLOUR = {
+            "excellent": GREEN, "good": GREEN, "fair": YELLOW,
+            "poor": ORANGE, "critical": RED,
+        }
+
+        doc = Document()
+        for section in doc.sections:
+            section.top_margin    = Inches(1)
+            section.bottom_margin = Inches(1)
+            section.left_margin   = Inches(1)
+            section.right_margin  = Inches(1)
+
+        style = doc.styles["Normal"]
+        style.font.name = "Arial"
+        style.font.size = Pt(11)
+
+        def h1(text):
+            p = doc.add_heading(text, level=1)
+            p.runs[0].font.color.rgb = BLUE
+            p.runs[0].font.name = "Arial"
+            p.runs[0].font.size = Pt(16)
+
+        def h2(text):
+            p = doc.add_heading(text, level=2)
+            p.runs[0].font.color.rgb = MID_BLUE
+            p.runs[0].font.name = "Arial"
+            p.runs[0].font.size = Pt(13)
+
+        def kv(key, value, vc=BLACK):
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(4)
+            rk = p.add_run(f"{key}: ")
+            rk.bold = True; rk.font.name = "Arial"; rk.font.size = Pt(11)
+            rv = p.add_run(value)
+            rv.font.name = "Arial"; rv.font.size = Pt(11)
+            rv.font.color.rgb = vc
+
+        def bullet(text):
+            p = doc.add_paragraph(text, style="List Bullet")
+            if p.runs:
+                p.runs[0].font.name = "Arial"
+                p.runs[0].font.size = Pt(11)
+
+        def body(text):
+            p = doc.add_paragraph(text)
+            if p.runs:
+                p.runs[0].font.name = "Arial"
+                p.runs[0].font.size = Pt(11)
+            p.paragraph_format.space_after = Pt(6)
+
+        def spacer():
+            doc.add_paragraph()
+
+        def score_bar(label, score):
+            """Render a score as 'label: XX/100 ██████░░░░' in a single paragraph."""
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(4)
+            rk = p.add_run(f"{label}: ")
+            rk.bold = True; rk.font.name = "Arial"; rk.font.size = Pt(11)
+            pct = max(0, min(100, int(score or 0)))
+            filled = round(pct / 10)
+            bar = "█" * filled + "░" * (10 - filled)
+            rv = p.add_run(f"{pct}/100  {bar}")
+            rv.font.name = "Arial"; rv.font.size = Pt(11)
+            color = GREEN if pct >= 70 else (YELLOW if pct >= 40 else RED)
+            rv.font.color.rgb = color
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        tp = doc.add_paragraph()
+        tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        tr = tp.add_run("Commit Guardian — Full Code Analysis Report")
+        tr.bold = True; tr.font.name = "Arial"; tr.font.size = Pt(20)
+        tr.font.color.rgb = BLUE
+
+        sp = doc.add_paragraph()
+        sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        sr = sp.add_run(f"{owner}/{repo}  ·  Generated {generated}")
+        sr.italic = True; sr.font.name = "Arial"; sr.font.size = Pt(9)
+        sr.font.color.rgb = GREY
+        spacer()
+
+        # ── Executive Summary ─────────────────────────────────────────────────
+        h1("Executive Summary")
+        health = analysis.get("overall_health", "unknown")
+        kv("Overall Health", health.upper(), vc=HEALTH_COLOUR.get(health, BLACK))
+        body(analysis.get("executive_summary", "No summary generated."))
+        spacer()
+
+        # ── Score Overview ─────────────────────────────────────────────────────
+        h1("Score Overview")
+        sec_score  = analysis.get("security", {}).get("score", 0)
+        qual_score = analysis.get("code_quality", {}).get("score", 0)
+        score_bar("Security Score", sec_score)
+        score_bar("Code Quality Score", qual_score)
+        spacer()
+
+        # ── Security ─────────────────────────────────────────────────────────
+        h1("Security Assessment")
+        sec = analysis.get("security", {})
+        body(sec.get("summary", ""))
+        if sec.get("findings"):
+            h2("Findings")
+            for f in sec["findings"]:
+                bullet(f)
+        if sec.get("recommendations"):
+            h2("Security Recommendations")
+            for r in sec["recommendations"]:
+                bullet(r)
+        spacer()
+
+        # ── Code Quality ──────────────────────────────────────────────────────
+        h1("Code Quality")
+        cq = analysis.get("code_quality", {})
+        body(cq.get("summary", ""))
+        if cq.get("strengths"):
+            h2("Strengths")
+            for s in cq["strengths"]:
+                bullet(s)
+        if cq.get("weaknesses"):
+            h2("Areas for Improvement")
+            for w in cq["weaknesses"]:
+                bullet(w)
+        spacer()
+
+        # ── Architecture ──────────────────────────────────────────────────────
+        h1("Architecture")
+        arch = analysis.get("architecture", {})
+        body(arch.get("summary", ""))
+        if arch.get("patterns_detected"):
+            h2("Patterns Detected")
+            for p in arch["patterns_detected"]:
+                bullet(p)
+        if arch.get("concerns"):
+            h2("Architectural Concerns")
+            for c in arch["concerns"]:
+                bullet(c)
+        spacer()
+
+        # ── Progress / Commit History ─────────────────────────────────────────
+        h1("Progress & Review History")
+        prog = analysis.get("progress", {})
+        body(prog.get("summary", ""))
+        total   = prog.get("total_commits_reviewed", len(reviews))
+        accepted = prog.get("accepted", sum(1 for r in reviews if r.get("status") == "accepted"))
+        declined = prog.get("declined", sum(1 for r in reviews if r.get("status") == "declined"))
+        pending  = prog.get("pending", sum(1 for r in reviews if r.get("status") == "pending"))
+        kv("Total Commits Reviewed", str(total))
+        kv("Accepted",  str(accepted), vc=GREEN)
+        kv("Declined",  str(declined), vc=RED)
+        kv("Pending",   str(pending),  vc=YELLOW)
+        kv("High Risk", str(prog.get("high_risk_commits", "?")))
+        kv("Trend",     prog.get("trend", "insufficient_data").replace("_", " ").title())
+        spacer()
+
+        # ── Dependencies ──────────────────────────────────────────────────────
+        h1("Dependencies")
+        deps = analysis.get("dependencies", {})
+        body(deps.get("summary", ""))
+        if deps.get("notable"):
+            for n in deps["notable"]:
+                bullet(n)
+        spacer()
+
+        # ── Top Recommendations ───────────────────────────────────────────────
+        h1("Top Recommendations")
+        for rec in (analysis.get("top_recommendations") or []):
+            bullet(rec)
+
+        fd, out_path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        doc.save(out_path)
+        return out_path
+
+    # ── Author performance docx builder ───────────────────────────────────────
+
+    async def _build_author_review_docx(
+        self, owner: str, repo: str, analysis: dict,
+    ) -> str:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            None,
+            lambda: self._build_author_review_docx_sync(owner, repo, analysis),
+        )
+
+    def _build_author_review_docx_sync(
+        self, owner: str, repo: str, analysis: dict,
+    ) -> str:
+        generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        BLUE     = RGBColor(0x1F, 0x49, 0x7D)
+        MID_BLUE = RGBColor(0x2E, 0x75, 0xB6)
+        GREEN    = RGBColor(0x37, 0x86, 0x10)
+        RED      = RGBColor(0xC0, 0x00, 0x00)
+        ORANGE   = RGBColor(0xC5, 0x5A, 0x11)
+        YELLOW   = RGBColor(0xBF, 0x8F, 0x00)
+        GREY     = RGBColor(0x88, 0x88, 0x88)
+        BLACK    = RGBColor(0x00, 0x00, 0x00)
+        GOLD     = RGBColor(0xFF, 0xD7, 0x00)
+
+        RATING_COLOUR = {
+            "excellent":     GREEN,
+            "good":          GREEN,
+            "average":       YELLOW,
+            "below_average": ORANGE,
+            "poor":          RED,
+        }
+
+        doc = Document()
+        for section in doc.sections:
+            section.top_margin    = Inches(1)
+            section.bottom_margin = Inches(1)
+            section.left_margin   = Inches(1)
+            section.right_margin  = Inches(1)
+
+        style = doc.styles["Normal"]
+        style.font.name = "Arial"
+        style.font.size = Pt(11)
+
+        def h1(text):
+            p = doc.add_heading(text, level=1)
+            p.runs[0].font.color.rgb = BLUE
+            p.runs[0].font.name = "Arial"; p.runs[0].font.size = Pt(16)
+
+        def h2(text):
+            p = doc.add_heading(text, level=2)
+            p.runs[0].font.color.rgb = MID_BLUE
+            p.runs[0].font.name = "Arial"; p.runs[0].font.size = Pt(13)
+
+        def kv(key, value, vc=BLACK):
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(4)
+            rk = p.add_run(f"{key}: ")
+            rk.bold = True; rk.font.name = "Arial"; rk.font.size = Pt(11)
+            rv = p.add_run(value)
+            rv.font.name = "Arial"; rv.font.size = Pt(11)
+            rv.font.color.rgb = vc
+
+        def bullet(text):
+            p = doc.add_paragraph(text, style="List Bullet")
+            if p.runs:
+                p.runs[0].font.name = "Arial"; p.runs[0].font.size = Pt(11)
+
+        def body(text):
+            p = doc.add_paragraph(text)
+            if p.runs:
+                p.runs[0].font.name = "Arial"; p.runs[0].font.size = Pt(11)
+            p.paragraph_format.space_after = Pt(6)
+
+        def spacer():
+            doc.add_paragraph()
+
+        # ── Title ─────────────────────────────────────────────────────────────
+        tp = doc.add_paragraph()
+        tp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        tr = tp.add_run("Commit Guardian — Author Performance Review")
+        tr.bold = True; tr.font.name = "Arial"; tr.font.size = Pt(20)
+        tr.font.color.rgb = BLUE
+
+        sp = doc.add_paragraph()
+        sp.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        sr = sp.add_run(f"{owner}/{repo}  ·  Generated {generated}")
+        sr.italic = True; sr.font.name = "Arial"; sr.font.size = Pt(9)
+        sr.font.color.rgb = GREY
+        spacer()
+
+        # ── Team Summary ──────────────────────────────────────────────────────
+        h1("Team Overview")
+        body(analysis.get("team_summary", "No summary generated."))
+
+        mvp = analysis.get("mvp")
+        if mvp:
+            p = doc.add_paragraph()
+            p.paragraph_format.space_after = Pt(4)
+            rk = p.add_run("🏆 MVP: ")
+            rk.bold = True; rk.font.name = "Arial"; rk.font.size = Pt(12)
+            rv = p.add_run(mvp)
+            rv.bold = True; rv.font.name = "Arial"; rv.font.size = Pt(12)
+            rv.font.color.rgb = GOLD
+
+        needs_attn = analysis.get("needs_attention")
+        if needs_attn:
+            kv("⚠️  Needs Attention", needs_attn, vc=ORANGE)
+        spacer()
+
+        # ── Per-author sections ───────────────────────────────────────────────
+        h1("Individual Author Reports")
+
+        authors = analysis.get("authors") or []
+        # Sort: best performers first
+        rating_order = {"excellent": 0, "good": 1, "average": 2, "below_average": 3, "poor": 4}
+        authors_sorted = sorted(
+            authors,
+            key=lambda a: rating_order.get(a.get("performance_rating", "average"), 2),
+        )
+
+        for author in authors_sorted:
+            name   = author.get("name", "Unknown")
+            rating = author.get("performance_rating", "average")
+            colour = RATING_COLOUR.get(rating, BLACK)
+
+            # Author heading with rating badge
+            hp = doc.add_heading(level=2)
+            hp.paragraph_format.space_before = Pt(12)
+            hr = hp.runs[0] if hp.runs else hp.add_run()
+            hr.text = name
+            hr.font.color.rgb = MID_BLUE
+            hr.font.name = "Arial"
+            hr.font.size = Pt(13)
+            badge_run = hp.add_run(f"  [{rating.replace('_', ' ').upper()}]")
+            badge_run.font.color.rgb = colour
+            badge_run.font.name = "Arial"
+            badge_run.font.size = Pt(11)
+            badge_run.bold = True
+
+            total   = author.get("total_commits", 0)
+            accepted = author.get("accepted", 0)
+            declined = author.get("declined", 0)
+            pending  = author.get("pending", 0)
+            high_risk = author.get("high_risk_commits", 0)
+            dr      = author.get("decline_rate_pct", 0)
+
+            kv("Total Commits",   str(total))
+            kv("Accepted",        str(accepted), vc=GREEN)
+            kv("Declined",        str(declined), vc=RED if declined > 0 else BLACK)
+            kv("Pending",         str(pending),  vc=YELLOW if pending > 0 else BLACK)
+            kv("High-Risk Commits", str(high_risk), vc=ORANGE if high_risk > 0 else BLACK)
+            kv("Decline Rate",    f"{dr}%", vc=RED if dr >= 40 else (ORANGE if dr >= 20 else GREEN))
+
+            if author.get("verdict"):
+                body(author["verdict"])
+
+            if author.get("strengths"):
+                p = doc.add_paragraph()
+                p.add_run("Strengths:").bold = True
+                for s in author["strengths"]:
+                    bullet(s)
+
+            if author.get("concerns"):
+                p = doc.add_paragraph()
+                p.add_run("Concerns:").bold = True
+                for c in author["concerns"]:
+                    bullet(c)
+
+            spacer()
+
+        fd, out_path = tempfile.mkstemp(suffix=".docx")
+        os.close(fd)
+        doc.save(out_path)
+        return out_path
 
     # ── Word report builder ───────────────────────────────────────────────────
 
