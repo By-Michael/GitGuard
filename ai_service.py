@@ -136,15 +136,15 @@ class AIService:
                 f"+{f['additions']}/-{f['deletions']} lines"
             )
             if f.get("patch"):
-                patch = f["patch"][:4000]  # Limit patch size per file
-                if len(f["patch"]) > 4000:
-                    patch += "\n... [TRUNCATED — diff exceeds limit, review manually]"
+                patch = f["patch"][:2000]  # Limit patch size per file
+                if len(f["patch"]) > 2000:
+                    patch += "\n... [truncated]"
                 file_entry += f"\n```diff\n{patch}\n```"
             files_info.append(file_entry)
 
         # Format repo context
         key_files_info = []
-        for file_data in repo_context.get("files", []):  # already capped at 20 upstream
+        for file_data in repo_context.get("files", [])[:10]:  # Top 10 most relevant files
             content_preview = file_data.get("content", "")[:1500]
             if len(file_data.get("content", "")) > 1500:
                 content_preview += "\n... [truncated]"
@@ -240,7 +240,11 @@ class AIService:
         except httpx.HTTPStatusError as exc:
             error_detail = ""
             try:
-                error_detail = exc.response.json().get("error", {}).get("message", exc.response.text)
+                err_json = exc.response.json()
+                if isinstance(err_json, dict):
+                    error_detail = err_json.get("error", {}).get("message", exc.response.text)
+                else:
+                    error_detail = exc.response.text[:500]
             except Exception:
                 error_detail = exc.response.text[:500]
             raise AIAnalysisError(
@@ -265,6 +269,13 @@ class AIService:
                     parsed = json.loads(json_match.group(1))
                 else:
                     raise AIAnalysisError(f"AI returned non-JSON response: {raw_content[:500]}")
+
+            # Some models wrap the response in a list even with json_object format — unwrap it
+            if isinstance(parsed, list):
+                logger.warning("AI returned a JSON list instead of object — unwrapping first element")
+                parsed = parsed[0] if parsed else {}
+            if not isinstance(parsed, dict):
+                raise AIAnalysisError(f"AI returned unexpected JSON type: {type(parsed).__name__}")
 
             decision = CommitDecision(
                 decision=parsed.get("decision", "review").lower().strip(),
