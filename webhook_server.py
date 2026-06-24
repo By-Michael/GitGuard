@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse
 import database as db
 from ai_service import CommitDecision, ai_service
 from config import CONFIG, logger
-from github_service import GitHubService, GitHubServiceError, RollbackError, WebhookVerificationError
+from github_service import GitHubAuthError, GitHubService, GitHubServiceError, RollbackError, WebhookVerificationError
 from telegram_service import TelegramAPIError, telegram_service
 from timeout_worker import run_timeout_worker
 
@@ -258,6 +258,19 @@ async def _process_commit_inner(
     )
     try:
         commit_metadata = await gh.fetch_commit_metadata(owner, repo, commit_sha)
+    except GitHubAuthError:
+        await telegram_service.delete_message(chat_id, proc)
+        await telegram_service.send_message(
+            chat_id,
+            f"🔑 *GitHub token no longer works*\n\n"
+            f"`{commit_sha[:7]}`\nRepo: `{owner}/{repo}`\n\n"
+            "Your token has expired, been revoked, or no longer has access to "
+            "this repo, so I can't fetch commits or auto-rollback right now.\n\n"
+            "Send /reconnect to paste a fresh token — your repo, branch, and "
+            "timeout settings will be kept.",
+        )
+        await gh.close()
+        return
     except GitHubServiceError as exc:
         await telegram_service.delete_message(chat_id, proc)
         await telegram_service.send_message(
@@ -393,6 +406,10 @@ async def telegram_webhook(request: Request):
             await telegram_service.handle_settings(chat_id)
             return {"ok": True}
 
+        if text.lower() == "/reconnect":
+            await telegram_service.handle_reconnect(chat_id)
+            return {"ok": True}
+
         if text.lower() == "/status":
             await _handle_status(chat_id)
             return {"ok": True}
@@ -439,6 +456,7 @@ async def _handle_help(chat_id: str) -> None:
         chat_id,
         "🤖 *Commit Guardian — Commands*\n\n"
         "/start — Set up or reconfigure your repo\n"
+        "/reconnect — Refresh an expired/revoked GitHub token (keeps your settings)\n"
         "/status — See your pending reviews\n"
         "/settings — Change timeout settings\n"
         "/help — This message\n\n"

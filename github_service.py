@@ -28,6 +28,12 @@ class WebhookVerificationError(GitHubServiceError):
 class GitHubAPIError(GitHubServiceError):
     pass
 
+class GitHubAuthError(GitHubAPIError):
+    """Raised specifically on 401 Bad credentials — token expired/revoked/malformed.
+    Kept distinct from GitHubAPIError so callers can prompt the user to
+    reconnect instead of showing a generic transient-failure message."""
+    pass
+
 class RollbackError(GitHubServiceError):
     pass
 
@@ -80,6 +86,11 @@ class GitHubService:
             response = await client.get(url)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
+            if exc.response.status_code == 401:
+                raise GitHubAuthError(
+                    f"Failed to fetch commit {commit_sha}: 401 Bad credentials — "
+                    "token is missing, expired, or revoked"
+                ) from exc
             raise GitHubAPIError(f"Failed to fetch commit {commit_sha}: {exc.response.status_code}") from exc
         except httpx.RequestError as exc:
             raise GitHubAPIError(f"Network error: {exc}") from exc

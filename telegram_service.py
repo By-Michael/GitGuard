@@ -220,6 +220,31 @@ class TelegramService:
         else:
             await self.send_message(chat_id, "Nothing to cancel. Send /start to configure.")
 
+    async def handle_reconnect(self, chat_id: str) -> None:
+        """Refresh an expired/revoked token without wiping repo/branch/timeout settings."""
+        user = db.get_user(chat_id)
+        if not user or not user.get("owner"):
+            await self.send_message(chat_id, "You're not set up yet. Send /start to begin.")
+            return
+        db.upsert_user(chat_id, onboard_step="await_reconnect_token")
+        await self.send_message(
+            chat_id,
+            f"{self.EMOJI['key']} *Reconnect GitHub*\n\n"
+            f"Currently monitoring `{user['owner']}/{user['repo']}` ({user.get('branch','main')}) — "
+            "this won't change.\n\n"
+            "📋 *How to create a new token:*\n"
+            "1. GitHub → avatar (top-right) → *Settings*\n"
+            "2. Left sidebar → *Developer settings*\n"
+            "3. *Personal access tokens* → *Tokens (classic)*\n"
+            "4. *Generate new token (classic)*\n"
+            "5. Name it `CommitGuardian`, set expiry (90 days)\n"
+            "6. Check these boxes:\n"
+            "   ☑️ `repo` — full repo access\n"
+            "   ☑️ `read:user` — read your username\n"
+            "7. *Generate token* — copy it immediately!\n\n"
+            "Paste your new token:",
+        )
+
     async def handle_start(self, chat_id: str) -> None:
         # Fix #9: warn the user if they have pending reviews before wiping config.
         user = db.get_user(chat_id)
@@ -334,6 +359,34 @@ class TelegramService:
                 "7. *Generate token* — copy it immediately!\n\n"
                 "⚠️ _GitHub only shows it once._\n\n"
                 "Paste your token:",
+            )
+            return True
+
+        # ── Reconnect: replace just the token, keep everything else ───────────
+        if step == "await_reconnect_token":
+            token = text.strip()
+            if not (token.startswith("ghp_") or token.startswith("github_pat_")):
+                await self.send_message(
+                    chat_id,
+                    f"{self.EMOJI['warning']} Doesn't look right "
+                    "(should start with `ghp_` or `github_pat_`).\nTry again:",
+                )
+                return True
+            valid, username = await self._validate_github_token(token)
+            if not valid:
+                await self.send_message(
+                    chat_id,
+                    f"{self.EMOJI['warning']} Token invalid or expired — GitHub returned an error.\n"
+                    "Please generate a new one and paste it here:",
+                )
+                return True
+            db.upsert_user(chat_id, github_token=token, onboard_step="done")
+            greeting = f" (logged in as `{username}`)" if username else ""
+            await self.send_message(
+                chat_id,
+                f"{self.EMOJI['check']} Token refreshed{greeting}. "
+                "I'll keep using your existing repo, branch, and timeout settings.\n\n"
+                "You're back up and running 🚀",
             )
             return True
 
