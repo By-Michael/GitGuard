@@ -1,0 +1,14 @@
+# Credentials and Secrets
+.env
+
+# Dependencies
+node_modules/
+
+# Databases and Local State
+commit_guardian
+commit_guardian.db-shm
+commit_guardian.db-wal
+
+# Compressed archives
+*.zip
+*.rar
