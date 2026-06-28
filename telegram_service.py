@@ -734,15 +734,14 @@ class TelegramService:
         """Send a message with a link to the support Telegram account."""
         keyboard = {
             "inline_keyboard": [
-                [{"text": "💬 Open Support Chat", "url": "https://t.me/nativered"}],
+                [{"text": "💬 Open Support Chat", "url": "https://t.me/mikoz_124"}],
             ]
         }
         await self.send_message(
             chat_id,
             "📞 *Contact Support*\n\n"
             "Having trouble or need help with Commit Guardian?\n\n"
-            "Reach out to our support team directly on Telegram:\n"
-            "👉 @nativered\n\n"
+            "Reach out to our support team directly on Telegram.\n\n"
             "_Tap the button below to open a chat with us._",
             reply_markup=keyboard,
         )
