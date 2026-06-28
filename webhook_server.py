@@ -260,15 +260,19 @@ async def _process_commit_inner(
         commit_metadata = await gh.fetch_commit_metadata(owner, repo, commit_sha)
     except GitHubAuthError:
         await telegram_service.delete_message(chat_id, proc)
-        await telegram_service.send_message(
-            chat_id,
-            f"🔑 *GitHub token no longer works*\n\n"
-            f"`{commit_sha[:7]}`\nRepo: `{owner}/{repo}`\n\n"
-            "Your token has expired, been revoked, or no longer has access to "
-            "this repo, so I can't fetch commits or auto-rollback right now.\n\n"
-            "Send /reconnect to paste a fresh token — your repo, branch, and "
-            "timeout settings will be kept.",
-        )
+        # Only alert once per cooldown window — every webhook push hitting a
+        # broken token would otherwise spam the user with identical messages.
+        if db.should_send_token_alert(chat_id):
+            await telegram_service.send_message(
+                chat_id,
+                f"🔑 *GitHub token no longer works*\n\n"
+                f"`{commit_sha[:7]}`\nRepo: `{owner}/{repo}`\n\n"
+                "Your token has expired, been revoked, or no longer has access to "
+                "this repo, so I can't fetch commits or auto-rollback right now.\n\n"
+                "Send /reconnect to paste a fresh token — your repo, branch, and "
+                "timeout settings will be kept.",
+            )
+            db.mark_token_alert_sent(chat_id)
         await gh.close()
         return
     except GitHubServiceError as exc:
@@ -422,6 +426,10 @@ async def telegram_webhook(request: Request):
             await telegram_service.show_main_menu(chat_id)
             return {"ok": True}
 
+        if text.lower() == "/hidemenu":
+            await telegram_service.hide_main_menu(chat_id)
+            return {"ok": True}
+
         # Mid-onboarding message — consumes input if a wizard step is active
         consumed = await telegram_service.handle_message(chat_id, text)
 
@@ -441,6 +449,8 @@ async def telegram_webhook(request: Request):
                 await telegram_service.handle_author_review(chat_id)
             elif text == "📞 Contact Support":
                 await telegram_service.handle_contact_support(chat_id)
+            elif text == "🙈 Hide Menu":
+                await telegram_service.hide_main_menu(chat_id)
 
     return {"ok": True}
 
@@ -484,8 +494,10 @@ async def _handle_help(chat_id: str) -> None:
         "🔍 Full Code Analysis — AI audit of your entire codebase (security, quality, progress)\n"
         "👥 Author Performance — per-developer commit quality report\n"
         "📞 Contact Support — reach our support team\n\n"
+        "🙈 Hide Menu — dismiss the keyboard (tap /menu to bring it back)\n\n"
         "📟 *Commands*\n"
         "/menu — show the menu keyboard\n"
+        "/hidemenu — hide the menu keyboard\n"
         "/start — set up or reconfigure your repo\n"
         "/reconnect — refresh an expired GitHub token\n"
         "/status — see your pending reviews\n"

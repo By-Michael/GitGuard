@@ -66,11 +66,14 @@ class TelegramService:
             [{"text": "👤 My Profile"}, {"text": "📜 Commit History"}],
             [{"text": "📊 Active Reviews"}, {"text": "⚙️ Settings"}],
             [{"text": "🔍 Full Code Analysis"}, {"text": "👥 Author Performance"}],
-            [{"text": "📞 Contact Support"}],
+            [{"text": "📞 Contact Support"}, {"text": "🙈 Hide Menu"}],
         ],
         "resize_keyboard": True,
         "is_persistent": True,
     }
+
+    # Sent to dismiss the reply keyboard; user can get it back with /menu.
+    HIDE_KEYBOARD = {"remove_keyboard": True}
 
     def __init__(self) -> None:
         self.token    = CONFIG.telegram_bot_token
@@ -227,6 +230,14 @@ class TelegramService:
         """Send (or re-send) the persistent reply keyboard."""
         await self.send_message(chat_id, text, reply_markup=self.MAIN_MENU_KEYBOARD)
 
+    async def hide_main_menu(self, chat_id: str) -> None:
+        """Dismiss the reply keyboard. User can restore it anytime with /menu."""
+        await self.send_message(
+            chat_id,
+            "Menu hidden. Send /menu whenever you want it back.",
+            reply_markup=self.HIDE_KEYBOARD,
+        )
+
     # ── Onboarding wizard (5 steps) ───────────────────────────────────────────
 
     async def handle_cancel(self, chat_id: str) -> None:
@@ -289,6 +300,7 @@ class TelegramService:
             timeout_hours=24,
             timeout_action="accept",
         )
+        db.clear_token_alert(chat_id)  # reset cooldown when user fully reconfigures
         await self.send_message(
             chat_id,
             f"{self.EMOJI['rocket']} *Welcome to Commit Guardian!*\n\n"
@@ -339,8 +351,7 @@ class TelegramService:
             repo  = repo.strip()
             # Fix #14: enforce GitHub's allowed character set so malformed values
             # are never stored in the DB.
-            _GITHUB_NAME_RE = re.compile(r"^[a-zA-Z0-9._-]{1,100}$")
-            if not _GITHUB_NAME_RE.match(owner) or not _GITHUB_NAME_RE.match(repo):
+            if not re.match(r"^[a-zA-Z0-9._-]{1,100}$", owner) or not re.match(r"^[a-zA-Z0-9._-]{1,100}$", repo):
                 await self.send_message(
                     chat_id,
                     f"{self.EMOJI['warning']} Invalid format — use only letters, numbers, "
@@ -399,6 +410,7 @@ class TelegramService:
                 )
                 return True
             db.upsert_user(chat_id, github_token=token, onboard_step="done")
+            db.clear_token_alert(chat_id)   # allow fresh alert if token breaks again
             greeting = f" (logged in as `{username}`)" if username else ""
             await self.send_message(
                 chat_id,
@@ -890,6 +902,8 @@ class TelegramService:
 
         try:
             repo_full    = commit_metadata.get("_repo_full_name", "")
+            if "/" not in repo_full:
+                raise ValueError(f"Missing repo info in commit metadata: {repo_full!r}")
             owner, repo  = repo_full.split("/", 1)
             user         = db.get_user(chat_id)
             from github_service import GitHubService
@@ -1058,7 +1072,7 @@ class TelegramService:
         self, owner: str, repo: str,
         analysis: dict, reviews: list,
     ) -> str:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self._build_code_analysis_docx_sync(owner, repo, analysis, reviews),
@@ -1259,7 +1273,7 @@ class TelegramService:
     async def _build_author_review_docx(
         self, owner: str, repo: str, analysis: dict,
     ) -> str:
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             lambda: self._build_author_review_docx_sync(owner, repo, analysis),
@@ -1438,7 +1452,7 @@ class TelegramService:
         Build a .docx transparency report using python-docx (pure Python, no Node.js).
         Runs in a thread executor so it doesn't block the event loop.
         """
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         out_path = await loop.run_in_executor(
             None,
             lambda: self._build_report_docx_sync(commit_metadata, decision, report_text),

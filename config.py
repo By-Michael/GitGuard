@@ -70,5 +70,11 @@ class Config:
         default_factory=lambda: _get_env("ROLLBACK_STRATEGY", default="revert")
     )
 
+    # Optional Telegram webhook secret — verifies updates actually come from Telegram.
+    # Set TELEGRAM_WEBHOOK_SECRET in .env to enable (see .env.example).
+    telegram_webhook_secret: Optional[str] = field(
+        default_factory=lambda: _get_env("TELEGRAM_WEBHOOK_SECRET", required=False, default=None)
+    )
+
 
 CONFIG = Config()

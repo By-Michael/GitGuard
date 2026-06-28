@@ -28,6 +28,7 @@ CLEAR = _CLEAR()
 _ALLOWED_USER_COLUMNS = frozenset({
     "github_token", "webhook_secret", "owner", "repo", "branch",
     "timeout_hours", "timeout_action", "onboard_step",
+    "token_alert_sent_at",   # ISO timestamp of last "token no longer works" alert
 })
 
 
@@ -45,17 +46,18 @@ def init_db() -> None:
     conn = _get_conn()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            chat_id          TEXT PRIMARY KEY,
-            github_token     TEXT,
-            webhook_secret   TEXT NOT NULL,
-            owner            TEXT,
-            repo             TEXT,
-            branch           TEXT DEFAULT 'main',
-            timeout_hours    INTEGER DEFAULT 24,
-            timeout_action   TEXT DEFAULT 'accept',
-            onboard_step     TEXT DEFAULT 'await_repo',
-            created_at       TEXT DEFAULT (datetime('now')),
-            updated_at       TEXT DEFAULT (datetime('now'))
+            chat_id              TEXT PRIMARY KEY,
+            github_token         TEXT,
+            webhook_secret       TEXT NOT NULL,
+            owner                TEXT,
+            repo                 TEXT,
+            branch               TEXT DEFAULT 'main',
+            timeout_hours        INTEGER DEFAULT 24,
+            timeout_action       TEXT DEFAULT 'accept',
+            onboard_step         TEXT DEFAULT 'await_repo',
+            token_alert_sent_at  TEXT DEFAULT NULL,
+            created_at           TEXT DEFAULT (datetime('now')),
+            updated_at           TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS active_reviews (
@@ -89,7 +91,50 @@ def init_db() -> None:
             queued_at  TEXT DEFAULT (datetime('now'))
         );
     """)
+    # Migration: add token_alert_sent_at to pre-existing databases.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(users)")}
+    if "token_alert_sent_at" not in existing_cols:
+        conn.execute("ALTER TABLE users ADD COLUMN token_alert_sent_at TEXT DEFAULT NULL")
     conn.commit()
+
+
+def should_send_token_alert(chat_id: str, cooldown_hours: int = 12) -> bool:
+    """
+    Return True only if we haven't sent a token-invalid alert within the
+    last `cooldown_hours` hours.  Prevents spamming the user with the same
+    error on every webhook push while their token stays broken.
+    """
+    import datetime
+    user = get_user(chat_id)
+    if not user:
+        return False
+    last = user.get("token_alert_sent_at")
+    if not last:
+        return True
+    try:
+        sent_at = datetime.datetime.fromisoformat(last)
+        delta   = datetime.datetime.utcnow() - sent_at
+        return delta.total_seconds() > cooldown_hours * 3600
+    except ValueError:
+        return True
+
+
+def mark_token_alert_sent(chat_id: str) -> None:
+    """Record current UTC time so duplicate token alerts are suppressed."""
+    _get_conn().execute(
+        "UPDATE users SET token_alert_sent_at = datetime('now') WHERE chat_id = ?",
+        (chat_id,),
+    )
+    _get_conn().commit()
+
+
+def clear_token_alert(chat_id: str) -> None:
+    """Reset alert flag after the user successfully provides a fresh token."""
+    _get_conn().execute(
+        "UPDATE users SET token_alert_sent_at = NULL WHERE chat_id = ?",
+        (chat_id,),
+    )
+    _get_conn().commit()
 
 
 def try_queue_sha(sha: str, chat_id: str) -> bool:
