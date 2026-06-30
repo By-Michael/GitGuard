@@ -5,9 +5,13 @@
 node_modules/
 
 # Databases and Local State
-commit_guardian
+commit_guardian.db
 commit_guardian.db-shm
 commit_guardian.db-wal
+
+# Python
+__pycache__/
+*.pyc
 
 # Compressed archives
 *.zip
