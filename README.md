@@ -27,6 +27,10 @@ It supports **multiple users** with completely isolated setups. Each person gets
 
 - **AI risk scoring** — every commit gets a confidence score, a risk level (low / medium / high / critical), a list of concerns, positive aspects, and specific recommendations, all generated with full awareness of your codebase
 - **One-tap rollback** — decline a commit and GitGuard immediately creates a safe revert commit on GitHub, or force-pushes the parent SHA if you prefer that approach
+-**Full Code Analysis** — Trigger deep, multi-file code sweeps on-demand via the Telegram menu to identify architectural flaws, security vulnerabilities, and code debt outside of standard commit triggers
+- **Author Performance** — Track team contribution metrics with AI-driven summaries of commit quality, code stability, and review approval rates per author
+- **Active Reviews Dashboard** — View and manage all pending, flagged, or currently in-progress commit reviews directly from an interactive Telegram inline menu
+- **Commit History Log** — Access an organized, historical archive of past repo commits
 - **Configurable auto-timeout** — set how many hours you want before GitGuard takes action on its own, and whether that action should be accept or rollback
 - **Multi-user, zero config sharing** — every user onboards through the Telegram bot and stores their own credentials; the server never shares tokens between accounts
 - **Downloadable reports** — tap the Report button to get a formatted `.docx` file with the full AI analysis, commit details, author info, and recommendations
