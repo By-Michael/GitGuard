@@ -78,6 +78,21 @@ def _get_env(key: str, required: bool = True, default: Optional[str] = None) -> 
     return value
 
 
+def _normalize_public_url(value: str) -> str:
+    """Ensure the public URL has a scheme.
+
+    Render's blueprint `fromService` wiring can only provide the bare
+    hostname (e.g. "gitguard.onrender.com"), not a full URL. If PUBLIC_URL
+    comes in without a scheme, assume https:// (Render services are always
+    served over TLS).
+    """
+    if not value:
+        return value
+    if not value.startswith(("http://", "https://")):
+        return f"https://{value}"
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     # ── Shared / global ───────────────────────────────────────────────────────
@@ -89,7 +104,13 @@ class Config:
     groq_temperature: float = field(default_factory=lambda: float(_get_env("GROQ_TEMPERATURE", default="0.3")))
 
     # Public-facing URL so onboarding can print the correct webhook URL
-    public_url: str = field(default_factory=lambda: _get_env("PUBLIC_URL", default="https://YOUR-SERVER-URL"))
+    # NOTE: Render's `fromService` blueprint wiring only exposes the bare
+    # hostname (e.g. "gitguard.onrender.com"), not a full URL with scheme.
+    # Prepend https:// if it's missing so downstream code can keep treating
+    # public_url as a ready-to-use URL.
+    public_url: str = field(default_factory=lambda: _normalize_public_url(
+        _get_env("PUBLIC_URL", default="https://YOUR-SERVER-URL")
+    ))
 
     # ── Server ────────────────────────────────────────────────────────────────
     server_host: str = field(default_factory=lambda: _get_env("SERVER_HOST", default="0.0.0.0"))

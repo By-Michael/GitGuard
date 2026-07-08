@@ -63,7 +63,7 @@ services:
         fromService:
           type: web
           name: gitguard
-          property: hostUrl
+          property: host
 
       # Sensible production defaults — override in the dashboard if needed.
       - key: LOG_FORMAT
