@@ -83,6 +83,14 @@ async def connect() -> None:
             # Fails fast on a dead/unreachable DB at startup instead of hanging
             # the whole app forever waiting for a connection.
             timeout=CONFIG.db_connect_timeout_seconds,
+            # REQUIRED when the DB sits behind PgBouncer (or any pooler) in
+            # transaction/statement pooling mode — which is the default on
+            # Render's managed Postgres. Server-side prepared statements are
+            # bound to one physical connection; PgBouncer can silently swap
+            # the physical connection between queries in the same asyncpg
+            # session, causing InvalidSQLStatementNameError. Setting the
+            # cache size to 0 makes asyncpg use unnamed statements instead.
+            statement_cache_size=0,
         )
     except (asyncpg.PostgresError, OSError, asyncio.TimeoutError) as exc:
         raise DatabaseConnectionError(f"Could not connect to Postgres: {exc}") from exc
