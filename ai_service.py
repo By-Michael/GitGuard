@@ -80,6 +80,7 @@ class AIService:
     def __init__(self) -> None:
         self.api_key = CONFIG.groq_api_key
         self.model = CONFIG.groq_model
+
         self.max_tokens = CONFIG.groq_max_tokens
         self.temperature = CONFIG.groq_temperature
         # Fix (Phase 2): reuse one pooled client across all Groq calls instead
@@ -100,16 +101,91 @@ class AIService:
             await self._client.aclose()
             self._client = None
 
-    def _get_headers(self) -> Dict[str, str]:
+    def _get_headers(self, key: Optional[str] = None) -> Dict[str, str]:
         """
         Fix #24: re-read the key from the environment on every request so a
         rotated key takes effect without restarting the server.
         """
-        key = os.getenv("GROQ_API_KEY", self.api_key)
+        key = key or os.getenv("GROQ_API_KEY", self.api_key)
         return {
             "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
+
+    def _get_api_keys(self) -> List[str]:
+        """
+        Ordered list of Groq API keys to try. Re-reads the environment each
+        time (same rationale as _get_headers) so rotating/adding keys takes
+        effect without a restart, while still falling back to whatever was
+        loaded into CONFIG at startup if the env var isn't set at call time.
+        """
+        keys: List[str] = []
+        primary = os.getenv("GROQ_API_KEY")
+        if primary:
+            keys.append(primary.strip())
+        for k in CONFIG.groq_api_keys:
+            if k not in keys:
+                keys.append(k)
+        return keys or [self.api_key]
+
+    async def _post_with_key_fallback(
+        self,
+        client: httpx.AsyncClient,
+        json_payload: Dict[str, Any],
+        *,
+        max_attempts: int = 3,
+    ) -> httpx.Response:
+        """
+        POST to the Groq chat completions endpoint, trying each configured
+        API key in turn. A key is considered "failed" for this request on
+        any HTTP error status or network-level error — most commonly a 429
+        (rate limit) on an exhausted free-tier key, but this also covers
+        auth errors, timeouts, and 5xx responses from Groq itself.
+
+        Nothing is surfaced to the caller until every key has failed; the
+        per-key failures are only logged (at debug/warning level) so that,
+        from the user's point of view, having multiple keys just makes the
+        service more reliable rather than something that occasionally
+        errors out. Only once the last key also fails does this raise, with
+        the error from that final attempt.
+        """
+        keys = self._get_api_keys()
+        last_exc: Optional[Exception] = None
+        last_response: Optional[httpx.Response] = None
+
+        for i, key in enumerate(keys):
+            try:
+                response = await request_with_retry(
+                    client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
+                    headers=self._get_headers(key), json=json_payload,
+                    max_attempts=max_attempts,
+                )
+            except httpx.RequestError as exc:
+                last_exc = exc
+                logger.warning(
+                    "Groq key #%d/%d network error, trying next key: %s",
+                    i + 1, len(keys), exc,
+                )
+                continue
+
+            if response.status_code == 429 or response.status_code >= 500:
+                last_response = response
+                logger.warning(
+                    "Groq key #%d/%d returned HTTP %d, trying next key",
+                    i + 1, len(keys), response.status_code,
+                )
+                continue
+
+            # Success, or a non-retryable 4xx (bad request, malformed
+            # payload, etc.) — hand it straight to the caller either way,
+            # since switching keys won't fix a request-shape problem.
+            return response
+
+        # Every key failed with a rate-limit/5xx/network error.
+        if last_response is not None:
+            return last_response
+        assert last_exc is not None
+        raise last_exc
 
     def _build_system_prompt(self) -> str:
         """Build the system prompt that defines the AI's role and expected output format."""
@@ -271,11 +347,7 @@ class AIService:
         async with self._semaphore:
             client = await self._get_client()
             try:
-                response = await request_with_retry(
-                    client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
-                    headers=self._get_headers(), json=payload,
-                    max_attempts=3,
-                )
+                response = await self._post_with_key_fallback(client, payload, max_attempts=3)
                 response.raise_for_status()
             except httpx.HTTPStatusError as exc:
                 error_detail = ""
@@ -419,10 +491,9 @@ class AIService:
 
         try:
             client = await self._get_client()
-            response = await request_with_retry(
-                client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
-                headers=self._get_headers(),
-                json={
+            response = await self._post_with_key_fallback(
+                client,
+                {
                     "model": self.model,
                     "messages": [
                         {
@@ -583,10 +654,9 @@ class AIService:
         try:
             async with self._semaphore:
                 client = await self._get_client()
-                response = await request_with_retry(
-                    client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
-                    headers=self._get_headers(),
-                    json={
+                response = await self._post_with_key_fallback(
+                    client,
+                    {
                         "model": self.model,
                         "messages": [
                             {"role": "system", "content": "You are a senior software auditor. Always respond with valid JSON only, no markdown."},
@@ -757,10 +827,9 @@ class AIService:
         try:
             async with self._semaphore:
                 client = await self._get_client()
-                response = await request_with_retry(
-                    client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
-                    headers=self._get_headers(),
-                    json={
+                response = await self._post_with_key_fallback(
+                    client,
+                    {
                         "model": self.model,
                         "messages": [
                             {"role": "system", "content": "You are a senior engineering manager. Respond with valid JSON only, no markdown."},

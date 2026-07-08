@@ -15,7 +15,7 @@ import os
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
 from dotenv import load_dotenv
 
@@ -78,6 +78,52 @@ def _get_env(key: str, required: bool = True, default: Optional[str] = None) -> 
     return value
 
 
+def _get_groq_api_keys() -> List[str]:
+    """
+    Collect every configured Groq API key, in priority order, for
+    fallback-on-failure (e.g. hitting a per-key rate limit).
+
+    Supports two ways of configuring extra keys:
+      - GROQ_API_KEYS="key1,key2,key3" (comma-separated, recommended)
+      - GROQ_API_KEY_2 / GROQ_API_KEY_3 / GROQ_API_KEY_4 ... (numbered)
+
+    GROQ_API_KEY (singular) is always first if present. Duplicates are
+    removed while preserving order.
+    """
+    keys: List[str] = []
+
+    primary = os.getenv("GROQ_API_KEY")
+    if primary:
+        keys.append(primary.strip())
+
+    bulk = os.getenv("GROQ_API_KEYS")
+    if bulk:
+        keys.extend(k.strip() for k in bulk.split(",") if k.strip())
+
+    n = 2
+    while True:
+        extra = os.getenv(f"GROQ_API_KEY_{n}")
+        if not extra:
+            break
+        keys.append(extra.strip())
+        n += 1
+
+    # de-dupe, preserve order
+    seen = set()
+    unique_keys: List[str] = []
+    for k in keys:
+        if k and k not in seen:
+            seen.add(k)
+            unique_keys.append(k)
+
+    if not unique_keys:
+        raise EnvironmentError(
+            "Missing required environment variable: GROQ_API_KEY. "
+            "Please set it in your .env file or environment."
+        )
+    return unique_keys
+
+
 def _normalize_public_url(value: str) -> str:
     """Ensure the public URL has a scheme.
 
@@ -99,6 +145,11 @@ class Config:
     telegram_bot_token: str = field(default_factory=lambda: _get_env("TELEGRAM_BOT_TOKEN"))
 
     groq_api_key:     str   = field(default_factory=lambda: _get_env("GROQ_API_KEY"))
+    # Ordered list of Groq API keys to try, falling back to the next one on
+    # failure (rate limit / auth / transient errors) instead of surfacing an
+    # error to the user until every key has been exhausted. See
+    # _get_groq_api_keys() for how extra keys are configured.
+    groq_api_keys:    List[str] = field(default_factory=_get_groq_api_keys)
     groq_model:       str   = field(default_factory=lambda: _get_env("GROQ_MODEL", default="llama-3.3-70b-versatile"))
     groq_max_tokens:  int   = field(default_factory=lambda: int(_get_env("GROQ_MAX_TOKENS", default="4096")))
     groq_temperature: float = field(default_factory=lambda: float(_get_env("GROQ_TEMPERATURE", default="0.3")))
