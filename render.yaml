@@ -1,44 +1,44 @@
-# Render Blueprint — Phase 5
+# Render Blueprint — Phase 5 (Free-tier variant)
 #
 # Deploy: push this repo to GitHub, then in the Render dashboard use
-# "New +" → "Blueprint" and point it at this repo. Render reads this file
-# and creates both resources below in one go, already wired together.
+# "New +" → "Blueprint" and point it at this repo.
+#
+# COST NOTE — read before deploying:
+# This variant runs on Render's FREE web service plan. Render no longer
+# offers a free Postgres tier at all, so there is no Render database
+# resource in this file — you must provision Postgres yourself on a free
+# external provider (Neon, Supabase, Aiven, etc.) and paste the connection
+# string into DATABASE_URL manually (see below).
+#
+# TRADE-OFF: Render's free web service plan spins the instance down after
+# ~15 min of no inbound HTTP traffic, and spin-up on the next request takes
+# a beat. Because timeout_worker.py and job_worker.py only run while the
+# process is alive, they simply pause while sleeping and resume on the next
+# request — reminders/timeouts/queued jobs can be delayed until something
+# wakes the service back up. If you need those to fire on time with no
+# gaps, you need an always-on paid instance instead, or an external
+# cron/uptime pinger hitting /health every few minutes to keep the
+# instance awake (note this does eat into Render's free monthly usage
+# hours).
 #
 # What this does NOT set for you (add these as secrets after first deploy,
 # via the Render dashboard → this service → Environment):
 #   TELEGRAM_BOT_TOKEN   your bot token from @BotFather
 #   GROQ_API_KEY         your Groq API key
+#   DATABASE_URL         your external Postgres connection string (must
+#                        include ?sslmode=require for most free providers —
+#                        see database.py, which passes the DSN to asyncpg
+#                        as-is)
 # PUBLIC_URL is set below using Render's own generated hostname via
 # `fromService`, so you don't need to hardcode or update it after deploy.
-#
-# DATABASE_URL is wired automatically from the `gitguard-db` instance below
-# via `fromDatabase` — asyncpg (see database.py) accepts the connection
-# string Render provides as-is.
-
-databases:
-  - name: gitguard-db
-    databaseName: gitguard
-    user: gitguard
-    plan: basic-256mb   # Render's cheapest paid Postgres tier — no free-tier
-                         # Postgres exists anymore, and free-tier compute
-                         # (see web service below) sleeps anyway, so the
-                         # cheapest *reliable* pairing is starter compute +
-                         # this tier of DB. Bump if you outgrow it later —
-                         # this is only a plan name, not a schema change.
-    region: oregon
-    postgresMajorVersion: "16"
 
 services:
   - type: web
     name: gitguard
     runtime: python
-    plan: starter        # Render's cheapest ALWAYS-ON compute tier. Do not
-                          # use the free tier for this service: the timeout
-                          # worker (timeout_worker.py) and job workers
-                          # (job_worker.py) both rely on the process staying
-                          # up between webhook events, and free-tier
-                          # instances spin down on idle (see README's note
-                          # on this under "Deploying to Render").
+    plan: free            # Render's free compute tier. Spins down after
+                          # ~15 min idle — see the COST NOTE above for what
+                          # that means for the background workers.
     region: oregon
     branch: main
     buildCommand: pip install -r requirements.txt
@@ -54,11 +54,12 @@ services:
       - key: GROQ_API_KEY
         sync: false
 
-      # Wired automatically — no manual entry needed.
+      # Set this manually to your external Postgres connection string
+      # (Neon/Supabase/Aiven free tier, etc.) — see COST NOTE above.
       - key: DATABASE_URL
-        fromDatabase:
-          name: gitguard-db
-          property: connectionString
+        sync: false
+
+      # Wired automatically — no manual entry needed.
       - key: PUBLIC_URL
         fromService:
           type: web
