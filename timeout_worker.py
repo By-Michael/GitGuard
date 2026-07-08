@@ -32,7 +32,7 @@ async def run_timeout_worker() -> None:
 
 
 async def _check_and_act() -> None:
-    stale = db.get_timed_out_reviews()
+    stale = await db.get_timed_out_reviews()
     if not stale:
         return
 
@@ -55,14 +55,16 @@ async def _check_and_act() -> None:
 
         # Mark timed_out=1 immediately — prevents re-processing in next cycle
         # even if the actions below fail or take a long time
-        db.mark_timed_out(commit_sha)
+        # Fix #29: scoped by (commit_sha, chat_id) — commit_sha alone isn't
+        # unique across users who share a repo. See schema note in database.py.
+        await db.mark_timed_out(commit_sha, chat_id)
 
         try:
             commit_metadata = json.loads(review["commit_meta_json"])
             decision_dict   = json.loads(review["decision_json"])
         except (json.JSONDecodeError, KeyError) as exc:
             logger.error("Cannot deserialise review %s: %s", sha_short, exc)
-            db.resolve_review(commit_sha, "error")
+            await db.resolve_review(commit_sha, chat_id, "error")
             continue
 
         decision = CommitDecision(
@@ -111,7 +113,7 @@ async def _auto_accept(tg, chat_id, message_id, commit_sha, commit_metadata, tim
             f"⏰ *Auto-accepted* `{sha_short}` after {timeout_hours}h with no response.\n"
             f"_{commit_metadata.get('message','')[:80]}_",
         )
-    db.resolve_review(commit_sha, "auto_accepted")
+    await db.resolve_review(commit_sha, chat_id, "auto_accepted")
     logger.info("Commit %s auto-accepted for %s", sha_short, chat_id)
 
 
@@ -155,7 +157,7 @@ async def _auto_decline(
             await tg.edit_message(chat_id, message_id, text, reply_markup={"inline_keyboard": []})
         except Exception:
             await tg.send_message(chat_id, text)
-        db.resolve_review(commit_sha, "auto_declined")
+        await db.resolve_review(commit_sha, chat_id, "auto_declined")
 
     else:
         # Rollback failed — tell the user and remove buttons to avoid confusion
@@ -174,7 +176,7 @@ async def _auto_decline(
         except Exception:
             await tg.send_message(chat_id, text)
         # Resolve so buttons are disabled — user must act manually via GitHub
-        db.resolve_review(commit_sha, "auto_decline_failed")
+        await db.resolve_review(commit_sha, chat_id, "auto_decline_failed")
 
     logger.info(
         "Commit %s auto-decline for %s — success: %s",

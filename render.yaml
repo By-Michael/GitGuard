@@ -1,0 +1,101 @@
+# Render Blueprint — Phase 5
+#
+# Deploy: push this repo to GitHub, then in the Render dashboard use
+# "New +" → "Blueprint" and point it at this repo. Render reads this file
+# and creates both resources below in one go, already wired together.
+#
+# What this does NOT set for you (add these as secrets after first deploy,
+# via the Render dashboard → this service → Environment):
+#   TELEGRAM_BOT_TOKEN   your bot token from @BotFather
+#   GROQ_API_KEY         your Groq API key
+# PUBLIC_URL is set below using Render's own generated hostname via
+# `fromService`, so you don't need to hardcode or update it after deploy.
+#
+# DATABASE_URL is wired automatically from the `gitguard-db` instance below
+# via `fromDatabase` — asyncpg (see database.py) accepts the connection
+# string Render provides as-is.
+
+databases:
+  - name: gitguard-db
+    databaseName: gitguard
+    user: gitguard
+    plan: basic-256mb   # Render's cheapest paid Postgres tier — no free-tier
+                         # Postgres exists anymore, and free-tier compute
+                         # (see web service below) sleeps anyway, so the
+                         # cheapest *reliable* pairing is starter compute +
+                         # this tier of DB. Bump if you outgrow it later —
+                         # this is only a plan name, not a schema change.
+    region: oregon
+    postgresMajorVersion: "16"
+
+services:
+  - type: web
+    name: gitguard
+    runtime: python
+    plan: starter        # Render's cheapest ALWAYS-ON compute tier. Do not
+                          # use the free tier for this service: the timeout
+                          # worker (timeout_worker.py) and job workers
+                          # (job_worker.py) both rely on the process staying
+                          # up between webhook events, and free-tier
+                          # instances spin down on idle (see README's note
+                          # on this under "Deploying to Render").
+    region: oregon
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn webhook_server:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      # Secrets — set these manually in the Render dashboard after first
+      # deploy (sync: false means Render won't ask for/store a default,
+      # and won't overwrite whatever you set there on redeploy).
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+
+      # Wired automatically — no manual entry needed.
+      - key: DATABASE_URL
+        fromDatabase:
+          name: gitguard-db
+          property: connectionString
+      - key: PUBLIC_URL
+        fromService:
+          type: web
+          name: gitguard
+          property: hostUrl
+
+      # Sensible production defaults — override in the dashboard if needed.
+      - key: LOG_FORMAT
+        value: json
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: GROQ_MAX_TOKENS
+        value: "4096"
+      - key: GROQ_TEMPERATURE
+        value: "0.3"
+      - key: ROLLBACK_STRATEGY
+        value: revert
+      - key: JOB_POLL_INTERVAL_SECONDS
+        value: "3"
+      - key: JOB_WORKER_COUNT
+        value: "3"
+      - key: JOB_MAX_ATTEMPTS
+        value: "3"
+      - key: DB_POOL_MIN
+        value: "2"
+      - key: DB_POOL_MAX
+        value: "10"
+
+      # Admin alerting (Phase 4) — set ADMIN_CHAT_ID manually (your own
+      # Telegram chat_id, from /status in the bot) to receive alerts when a
+      # failure category repeats past threshold. Left unset by default;
+      # GitGuard logs a warning instead of alerting if it's empty.
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: ALERT_FAILURE_THRESHOLD
+        value: "5"
+      - key: ALERT_WINDOW_SECONDS
+        value: "600"
+      - key: ALERT_COOLDOWN_SECONDS
+        value: "1800"

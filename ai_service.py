@@ -14,16 +14,9 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from config import CONFIG, logger
-
-
-class AIServiceError(Exception):
-    """Base exception for AI service errors."""
-    pass
-
-
-class AIAnalysisError(AIServiceError):
-    """Raised when the AI analysis API call fails."""
-    pass
+from http_utils import DEFAULT_LIMITS, LONG_READ_TIMEOUT, request_with_retry
+from exceptions import AIServiceError, AIAnalysisError  # noqa: F401 (Phase 4 shared hierarchy)
+from risk_guardrails import scan_commit, scan_repo_files, risk_level_to_band, apply_guardrails
 
 
 @dataclass
@@ -42,10 +35,22 @@ class CommitDecision:
     transparency_report: str = ""  # Detailed explanation for end users
     raw_response: str = ""  # Full raw AI response for debugging
 
+    # Phase 4 scoring fix: confidence_score is the MODEL'S confidence in its
+    # own verdict — it is not a safety/risk score and was previously the
+    # only number shown to users, which is what produced misleading reads
+    # like "80/100" on a structurally dangerous one-character change.
+    # safety_score is deterministic-anchored (see risk_guardrails.py): its
+    # band is fixed by risk_level, so it can never disagree with the risk
+    # label shown next to it.
+    safety_score: int = 50
+    guardrail_triggered: bool = False
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "decision": self.decision,
             "confidence_score": self.confidence_score,
+            "safety_score": self.safety_score,
+            "guardrail_triggered": self.guardrail_triggered,
             "risk_level": self.risk_level,
             "summary": self.summary,
             "reasoning": self.reasoning,
@@ -77,6 +82,23 @@ class AIService:
         self.model = CONFIG.groq_model
         self.max_tokens = CONFIG.groq_max_tokens
         self.temperature = CONFIG.groq_temperature
+        # Fix (Phase 2): reuse one pooled client across all Groq calls instead
+        # of opening a fresh TLS connection per request. Every call site below
+        # used to do `async with httpx.AsyncClient(...) as client:` — under
+        # concurrent commit processing that meant N simultaneous TCP+TLS
+        # handshakes to the same host instead of N requests sharing a
+        # keep-alive pool.
+        self._client: Optional[httpx.AsyncClient] = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=LONG_READ_TIMEOUT, limits=DEFAULT_LIMITS)
+        return self._client
+
+    async def close(self) -> None:
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
 
     def _get_headers(self) -> Dict[str, str]:
         """
@@ -242,46 +264,34 @@ class AIService:
             len(system_prompt) + len(user_prompt),
         )
 
-        # Fix #8: limit concurrent Groq calls and retry on 429 with exponential backoff.
-        # Only 429 (rate limit) is retried — all other HTTP errors fail immediately.
+        # Fix #8: limit concurrent Groq calls to avoid hammering the single
+        # shared API key when many users push at once. Transient failures
+        # (429 / 5xx / connection errors) are retried by request_with_retry;
+        # any other HTTP error (4xx besides 429) fails immediately.
         async with self._semaphore:
-            for attempt in range(3):
+            client = await self._get_client()
+            try:
+                response = await request_with_retry(
+                    client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
+                    headers=self._get_headers(), json=payload,
+                    max_attempts=3,
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                error_detail = ""
                 try:
-                    async with httpx.AsyncClient(timeout=120.0) as client:
-                        response = await client.post(
-                            f"{self.GROQ_API_BASE}/chat/completions",
-                            headers=self._get_headers(),
-                            json=payload,
-                        )
-                        if response.status_code == 429:
-                            if attempt == 2:
-                                raise AIAnalysisError("Groq API rate limit exceeded after 3 attempts")
-                            wait = 2 ** attempt
-                            logger.warning(
-                                "Groq rate-limited (attempt %d/3) — retrying in %ds", attempt + 1, wait
-                            )
-                            await asyncio.sleep(wait)
-                            continue
-                        # Any non-429 HTTP error fails immediately — no retry.
-                        response.raise_for_status()
-                        break  # success
-                except httpx.HTTPStatusError as exc:
-                    error_detail = ""
-                    try:
-                        err_json = exc.response.json()
-                        if isinstance(err_json, dict):
-                            error_detail = err_json.get("error", {}).get("message", exc.response.text)
-                        else:
-                            error_detail = exc.response.text[:500]
-                    except Exception:
+                    err_json = exc.response.json()
+                    if isinstance(err_json, dict):
+                        error_detail = err_json.get("error", {}).get("message", exc.response.text)
+                    else:
                         error_detail = exc.response.text[:500]
-                    raise AIAnalysisError(
-                        f"Groq API error (HTTP {exc.response.status_code}): {error_detail}"
-                    ) from exc
-                except httpx.RequestError as exc:
-                    if attempt == 2:
-                        raise AIAnalysisError(f"Network error connecting to Groq API: {exc}") from exc
-                    await asyncio.sleep(2 ** attempt)
+                except Exception:
+                    error_detail = exc.response.text[:500]
+                raise AIAnalysisError(
+                    f"Groq API error (HTTP {exc.response.status_code}): {error_detail}"
+                ) from exc
+            except httpx.RequestError as exc:
+                raise AIAnalysisError(f"Network error connecting to Groq API: {exc}") from exc
 
         # Parse response
         try:
@@ -329,11 +339,23 @@ class AIService:
             # Clamp confidence score
             decision.confidence_score = max(0.0, min(1.0, decision.confidence_score))
 
+            # Phase 4 scoring fix: run deterministic guardrails over the raw
+            # patches (not the model's summary of them) and recompute a
+            # safety_score whose band is locked to risk_level. This can only
+            # escalate risk/decline, never soften what the model said.
+            apply_guardrails(decision, commit_metadata)
+            if decision.guardrail_triggered:
+                logger.warning(
+                    "Guardrails escalated commit %s — risk now %s, safety_score %d",
+                    commit_metadata.get("sha", "?")[:7], decision.risk_level, decision.safety_score,
+                )
+
             logger.info(
-                "AI analysis complete — decision: %s, risk: %s, confidence: %.0f%%",
+                "AI analysis complete — decision: %s, risk: %s, confidence: %.0f%%, safety_score: %d",
                 decision.decision,
                 decision.risk_level,
                 decision.confidence_score * 100,
+                decision.safety_score,
             )
             return decision
 
@@ -396,28 +418,28 @@ class AIService:
         """)
 
         try:
-            async with httpx.AsyncClient(timeout=120.0) as client:
-                response = await client.post(
-                    f"{self.GROQ_API_BASE}/chat/completions",
-                    headers=self._get_headers(),
-                    json={
-                        "model": self.model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": "You are an expert technical writer specializing in clear, honest commit analysis reports. You explain complex code changes in accessible but technically accurate language. You never sugarcoat risks and always back claims with specific references to files or code patterns.",
-                            },
-                            {"role": "user", "content": prompt},
-                        ],
-                        "max_tokens": self.max_tokens,
-                        "temperature": 0.4,
-                    },
-                )
-                response.raise_for_status()
-                
-                report = response.json()["choices"][0]["message"]["content"]
-                logger.info("Generated expanded transparency report (~%d chars)", len(report))
-                return report
+            client = await self._get_client()
+            response = await request_with_retry(
+                client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
+                headers=self._get_headers(),
+                json={
+                    "model": self.model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "You are an expert technical writer specializing in clear, honest commit analysis reports. You explain complex code changes in accessible but technically accurate language. You never sugarcoat risks and always back claims with specific references to files or code patterns.",
+                        },
+                        {"role": "user", "content": prompt},
+                    ],
+                    "max_tokens": self.max_tokens,
+                    "temperature": 0.4,
+                },
+            )
+            response.raise_for_status()
+
+            report = response.json()["choices"][0]["message"]["content"]
+            logger.info("Generated expanded transparency report (~%d chars)", len(report))
+            return report
 
         except Exception as exc:
             logger.error("Failed to generate expanded transparency report: %s", exc)
@@ -455,16 +477,35 @@ class AIService:
         """
 
         # -- summarise historical reviews with tiny footprint --
+        # Also tally authoritative counts locally (Phase 4 fix): previously
+        # the "progress" numbers in the report were whatever the LLM chose
+        # to restate from this same text, which it can miscount or round —
+        # especially past ~15-20 line items. We now compute them here and
+        # overwrite the model's numbers after the call, so the report's
+        # figures are always exactly right regardless of what the model says.
         review_summary_lines: List[str] = []
+        local_progress = {"total_commits_reviewed": 0, "accepted": 0, "declined": 0,
+                           "pending": 0, "high_risk_commits": 0}
         for r in (reviews or [])[-30:]:
             try:
                 dec = json.loads(r.get("decision_json") or "{}")
             except Exception:
                 dec = {}
+            status = r.get("status", "?")
+            risk = (dec.get("risk_level") or "").lower()
+            local_progress["total_commits_reviewed"] += 1
+            if status == "accepted":
+                local_progress["accepted"] += 1
+            elif status == "declined":
+                local_progress["declined"] += 1
+            else:
+                local_progress["pending"] += 1
+            if risk in ("high", "critical"):
+                local_progress["high_risk_commits"] += 1
             review_summary_lines.append(
                 f"SHA:{(r.get('commit_sha') or '')[:7]} "
-                f"status:{r.get('status','?')} "
-                f"risk:{dec.get('risk_level','?')} "
+                f"status:{status} "
+                f"risk:{risk or '?'} "
                 f"decision:{dec.get('decision','?')}"
             )
 
@@ -541,24 +582,48 @@ class AIService:
 
         try:
             async with self._semaphore:
-                async with httpx.AsyncClient(timeout=120.0) as client:
-                    response = await client.post(
-                        f"{self.GROQ_API_BASE}/chat/completions",
-                        headers=self._get_headers(),
-                        json={
-                            "model": self.model,
-                            "messages": [
-                                {"role": "system", "content": "You are a senior software auditor. Always respond with valid JSON only, no markdown."},
-                                {"role": "user", "content": prompt},
-                            ],
-                            "max_tokens": 2000,
-                            "temperature": 0.2,
-                            "response_format": {"type": "json_object"},
-                        },
-                    )
-                    response.raise_for_status()
+                client = await self._get_client()
+                response = await request_with_retry(
+                    client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
+                    headers=self._get_headers(),
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": "You are a senior software auditor. Always respond with valid JSON only, no markdown."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "max_tokens": 2000,
+                        "temperature": 0.2,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                response.raise_for_status()
             raw = response.json()["choices"][0]["message"]["content"]
             result = json.loads(raw)
+
+            # Phase 4 fix: numeric progress fields come from our local tally,
+            # not the model's restatement of the same input.
+            result.setdefault("progress", {})
+            result["progress"].update(local_progress)
+            result["progress"].setdefault("trend", "insufficient_data" if local_progress["total_commits_reviewed"] < 5 else "stable")
+
+            # Phase 4 fix: deterministic secret scan over the actual file
+            # contents, merged into the security section so a hardcoded
+            # credential can't be missed just because the model didn't
+            # flag it from a 1500-char preview.
+            guardrail_flags = scan_repo_files(repo_context.get("files") or [])
+            if guardrail_flags:
+                result.setdefault("security", {})
+                findings = list(result["security"].get("findings") or [])
+                for gf in guardrail_flags:
+                    findings.append(f"[guardrail] {gf.file}: {gf.message}")
+                result["security"]["findings"] = findings
+                # A confirmed hardcoded secret caps the security score —
+                # the model's own score can't be higher than this.
+                result["security"]["score"] = min(int(result["security"].get("score", 100) or 100), 20)
+                if result.get("overall_health") in ("excellent", "good"):
+                    result["overall_health"] = "poor"
+
             logger.info("Full codebase analysis complete — health: %s", result.get("overall_health"))
             return result
         except Exception as exc:
@@ -691,24 +756,51 @@ class AIService:
 
         try:
             async with self._semaphore:
-                async with httpx.AsyncClient(timeout=90.0) as client:
-                    response = await client.post(
-                        f"{self.GROQ_API_BASE}/chat/completions",
-                        headers=self._get_headers(),
-                        json={
-                            "model": self.model,
-                            "messages": [
-                                {"role": "system", "content": "You are a senior engineering manager. Respond with valid JSON only, no markdown."},
-                                {"role": "user", "content": prompt},
-                            ],
-                            "max_tokens": 2000,
-                            "temperature": 0.2,
-                            "response_format": {"type": "json_object"},
-                        },
-                    )
-                    response.raise_for_status()
+                client = await self._get_client()
+                response = await request_with_retry(
+                    client, "POST", f"{self.GROQ_API_BASE}/chat/completions",
+                    headers=self._get_headers(),
+                    json={
+                        "model": self.model,
+                        "messages": [
+                            {"role": "system", "content": "You are a senior engineering manager. Respond with valid JSON only, no markdown."},
+                            {"role": "user", "content": prompt},
+                        ],
+                        "max_tokens": 2000,
+                        "temperature": 0.2,
+                        "response_format": {"type": "json_object"},
+                    },
+                )
+                response.raise_for_status()
             raw = response.json()["choices"][0]["message"]["content"]
             result = json.loads(raw)
+
+            # Phase 4 fix: the model restates total/accepted/declined/etc.
+            # per author from the same stats we already computed exactly —
+            # it can transpose or miscount, especially with several authors
+            # in one prompt. Overwrite its numbers with the authoritative
+            # local tally so the report can never show wrong figures; only
+            # the qualitative fields (rating, strengths, concerns, verdict)
+            # stay AI-generated.
+            for author_entry in result.get("authors", []):
+                s = stats.get(author_entry.get("name"))
+                if not s:
+                    # try loose match in case the model normalised the name slightly
+                    s = next((v for k, v in stats.items() if k.split(" <")[0] == (author_entry.get("name") or "").split(" <")[0]), None)
+                if not s:
+                    continue
+                decline_rate = round(s["declined"] / s["total"] * 100) if s["total"] else 0
+                author_entry["total_commits"] = s["total"]
+                author_entry["accepted"] = s["accepted"]
+                author_entry["declined"] = s["declined"]
+                author_entry["pending"] = s["pending"]
+                author_entry["high_risk_commits"] = s["high_risk"]
+                author_entry["decline_rate_pct"] = decline_rate
+                # keep the model's qualitative rating in sync with the hard rule
+                # stated in the prompt, in case it didn't apply it consistently
+                if decline_rate > 40 and author_entry.get("performance_rating") in ("excellent", "good", "average"):
+                    author_entry["performance_rating"] = "below_average"
+
             # Attach local raw stats for the docx builder to use
             result["_raw_stats"] = dict(stats)
             logger.info("Author analysis complete — %d authors", len(result.get("authors", [])))

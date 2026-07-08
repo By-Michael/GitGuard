@@ -25,13 +25,21 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH
 from ai_service import CommitDecision, ai_service
 from config import CONFIG, logger
 import database as db
+from http_utils import DEFAULT_LIMITS, DEFAULT_TIMEOUT, request_with_retry
+from exceptions import TelegramServiceError, TelegramAPIError  # noqa: F401 (Phase 4 shared hierarchy)
 
 
-class TelegramServiceError(Exception):
-    pass
-
-class TelegramAPIError(TelegramServiceError):
-    pass
+def _telegram_retry_after(response: httpx.Response) -> Optional[float]:
+    """
+    Telegram puts its 429 backoff hint in the JSON body
+    (`result.parameters.retry_after`), not a Retry-After header — this is
+    the correct value to honor; the generic header parser in http_utils
+    won't find anything here so it falls back to this getter.
+    """
+    try:
+        return float(response.json().get("parameters", {}).get("retry_after"))
+    except Exception:
+        return None
 
 
 class TelegramService:
@@ -84,7 +92,7 @@ class TelegramService:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(timeout=30.0)
+            self._client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT, limits=DEFAULT_LIMITS)
         return self._client
 
     async def close(self) -> None:
@@ -138,7 +146,7 @@ class TelegramService:
             payload["reply_markup"] = json.dumps(reply_markup)
         try:
             client   = await self._get_client()
-            response = await client.post(f"{self.base_url}/sendMessage", json=payload)
+            response = await request_with_retry(client, "POST", retry_after_getter=_telegram_retry_after, url=f"{self.base_url}/sendMessage", json=payload)
             response.raise_for_status()
             result = response.json()
             if not result.get("ok"):
@@ -165,7 +173,7 @@ class TelegramService:
             payload["reply_markup"] = json.dumps(reply_markup)
         try:
             client = await self._get_client()
-            r = await client.post(f"{self.base_url}/editMessageText", json=payload)
+            r = await request_with_retry(client, "POST", retry_after_getter=_telegram_retry_after, url=f"{self.base_url}/editMessageText", json=payload)
             # Fix #23: if the original card was deleted by the user, fall back to
             # sending a fresh message so the outcome is never silently lost.
             if r.status_code == 400:
@@ -183,7 +191,7 @@ class TelegramService:
     async def delete_message(self, chat_id: str, message_id: int) -> None:
         try:
             client = await self._get_client()
-            await client.post(
+            await request_with_retry(client, "POST", retry_after_getter=_telegram_retry_after, url=
                 f"{self.base_url}/deleteMessage",
                 json={"chat_id": chat_id, "message_id": message_id},
             )
@@ -203,7 +211,7 @@ class TelegramService:
             payload["show_alert"] = True
         try:
             client = await self._get_client()
-            await client.post(f"{self.base_url}/answerCallbackQuery", json=payload)
+            await request_with_retry(client, "POST", retry_after_getter=_telegram_retry_after, url=f"{self.base_url}/answerCallbackQuery", json=payload)
         except httpx.HTTPError as exc:
             logger.warning("Could not answer callback: %s", exc)
 
@@ -219,7 +227,7 @@ class TelegramService:
                 data: Dict[str, Any] = {"chat_id": chat_id}
                 if caption:
                     data["caption"] = caption[:1024]
-                response = await client.post(f"{self.base_url}/sendDocument", data=data, files=files)
+                response = await request_with_retry(client, "POST", retry_after_getter=_telegram_retry_after, url=f"{self.base_url}/sendDocument", data=data, files=files)
             response.raise_for_status()
         except httpx.HTTPError as exc:
             raise TelegramAPIError(f"Failed to send document: {exc}") from exc
@@ -242,20 +250,20 @@ class TelegramService:
 
     async def handle_cancel(self, chat_id: str) -> None:
         """Fix #22: escape hatch — lets user abort onboarding at any step."""
-        user = db.get_user(chat_id)
+        user = await db.get_user(chat_id)
         if user and user.get("onboard_step") not in (None, "done"):
-            db.upsert_user(chat_id, onboard_step="done")
+            await db.upsert_user(chat_id, onboard_step="done")
             await self.send_message(chat_id, "Setup cancelled. Send /start to begin again.")
         else:
             await self.send_message(chat_id, "Nothing to cancel. Send /start to configure.")
 
     async def handle_reconnect(self, chat_id: str) -> None:
         """Refresh an expired/revoked token without wiping repo/branch/timeout settings."""
-        user = db.get_user(chat_id)
+        user = await db.get_user(chat_id)
         if not user or not user.get("owner"):
             await self.send_message(chat_id, "You're not set up yet. Send /start to begin.")
             return
-        db.upsert_user(chat_id, onboard_step="await_reconnect_token")
+        await db.upsert_user(chat_id, onboard_step="await_reconnect_token")
         await self.send_message(
             chat_id,
             f"{self.EMOJI['key']} *Reconnect GitHub*\n\n"
@@ -276,9 +284,9 @@ class TelegramService:
 
     async def handle_start(self, chat_id: str) -> None:
         # Fix #9: warn the user if they have pending reviews before wiping config.
-        user = db.get_user(chat_id)
-        if user and db.get_active_reviews_for_user(chat_id):
-            db.upsert_user(chat_id, onboard_step="await_restart_confirm")
+        user = await db.get_user(chat_id)
+        if user and await db.get_active_reviews_for_user(chat_id):
+            await db.upsert_user(chat_id, onboard_step="await_restart_confirm")
             await self.send_message(
                 chat_id,
                 f"{self.EMOJI['warning']} *You have pending reviews.*\n\n"
@@ -292,7 +300,7 @@ class TelegramService:
 
     async def _do_start(self, chat_id: str) -> None:
         """Actually reset config and start the onboarding wizard."""
-        db.upsert_user(
+        await db.upsert_user(
             chat_id,
             onboard_step="await_repo",
             owner=db.CLEAR, repo=db.CLEAR, branch="main",
@@ -300,7 +308,7 @@ class TelegramService:
             timeout_hours=24,
             timeout_action="accept",
         )
-        db.clear_token_alert(chat_id)  # reset cooldown when user fully reconfigures
+        await db.clear_token_alert(chat_id)  # reset cooldown when user fully reconfigures
         await self.send_message(
             chat_id,
             f"{self.EMOJI['rocket']} *Welcome to Commit Guardian!*\n\n"
@@ -312,7 +320,7 @@ class TelegramService:
 
     async def handle_message(self, chat_id: str, text: str) -> bool:
         """Returns True if message was consumed by the wizard."""
-        user = db.get_user(chat_id)
+        user = await db.get_user(chat_id)
         if not user:
             return False
 
@@ -358,7 +366,7 @@ class TelegramService:
                     "hyphens, dots, or underscores (max 100 chars each).\nTry again:",
                 )
                 return True
-            db.upsert_user(chat_id, owner=owner, repo=repo, onboard_step="await_branch")
+            await db.upsert_user(chat_id, owner=owner, repo=repo, onboard_step="await_branch")
             await self.send_message(
                 chat_id,
                 f"{self.EMOJI['check']} Repo: `{owner}/{repo}`\n\n"
@@ -370,7 +378,7 @@ class TelegramService:
         # ── Step 2: branch ────────────────────────────────────────────────────
         if step == "await_branch":
             branch = text.strip() or "main"
-            db.upsert_user(chat_id, branch=branch, onboard_step="await_token")
+            await db.upsert_user(chat_id, branch=branch, onboard_step="await_token")
             await self.send_message(
                 chat_id,
                 f"{self.EMOJI['check']} Branch: `{branch}`\n\n"
@@ -409,8 +417,8 @@ class TelegramService:
                     "Please generate a new one and paste it here:",
                 )
                 return True
-            db.upsert_user(chat_id, github_token=token, onboard_step="done")
-            db.clear_token_alert(chat_id)   # allow fresh alert if token breaks again
+            await db.upsert_user(chat_id, github_token=token, onboard_step="done")
+            await db.clear_token_alert(chat_id)   # allow fresh alert if token breaks again
             greeting = f" (logged in as `{username}`)" if username else ""
             await self.send_message(
                 chat_id,
@@ -440,7 +448,7 @@ class TelegramService:
                     "Please generate a new one and paste it here:",
                 )
                 return True
-            db.upsert_user(chat_id, github_token=token, onboard_step="await_timeout_hours")
+            await db.upsert_user(chat_id, github_token=token, onboard_step="await_timeout_hours")
             greeting = f" (logged in as `{username}`)" if username else ""
             await self.send_message(
                 chat_id,
@@ -470,11 +478,11 @@ class TelegramService:
                 )
                 return True
 
-            db.upsert_user(chat_id, timeout_hours=hours, onboard_step="await_timeout_action")
+            await db.upsert_user(chat_id, timeout_hours=hours, onboard_step="await_timeout_action")
 
             if hours == 0:
                 # Skip action step — auto-action is disabled
-                db.upsert_user(chat_id, timeout_action="none", onboard_step="done")
+                await db.upsert_user(chat_id, timeout_action="none", onboard_step="done")
                 await self._finish_onboarding(chat_id)
                 return True
 
@@ -498,14 +506,14 @@ class TelegramService:
                 )
                 return True
 
-            db.upsert_user(chat_id, timeout_action=action, onboard_step="done")
+            await db.upsert_user(chat_id, timeout_action=action, onboard_step="done")
             await self._finish_onboarding(chat_id)
             return True
 
         # ── Branch-only update (from My Profile edit) ─────────────────────────
         if step == "await_branch_update":
             branch = text.strip() or "main"
-            db.upsert_user(chat_id, branch=branch, onboard_step="done")
+            await db.upsert_user(chat_id, branch=branch, onboard_step="done")
             await self.send_message(chat_id, f"{self.EMOJI['check']} Branch updated to `{branch}`.")
             await self.handle_my_profile(chat_id)
             return True
@@ -519,9 +527,10 @@ class TelegramService:
         """
         try:
             async with httpx.AsyncClient(timeout=15.0) as client:
-                r = await client.get(
-                    "https://api.github.com/user",
+                r = await request_with_retry(
+                    client, "GET", "https://api.github.com/user",
                     headers={"Authorization": f"token {token}", "User-Agent": "CommitGuardian/2.0"},
+                    max_attempts=2,  # onboarding is interactive — fail fast, don't make the user wait
                 )
                 if r.status_code == 200:
                     return True, r.json().get("login", "")
@@ -531,7 +540,7 @@ class TelegramService:
             return False, ""
 
     async def _finish_onboarding(self, chat_id: str) -> None:
-        user           = db.get_user(chat_id)
+        user           = await db.get_user(chat_id)
         webhook_secret = user["webhook_secret"]
         owner          = user["owner"]
         repo           = user["repo"]
@@ -571,8 +580,8 @@ class TelegramService:
 
     async def handle_settings(self, chat_id: str) -> None:
         """Show current settings with quick-change options."""
-        user = db.get_user(chat_id)
-        if not user or not db.is_setup_complete(chat_id):
+        user = await db.get_user(chat_id)
+        if not user or not await db.is_setup_complete(chat_id):
             await self.send_message(chat_id, "You're not set up yet. Send /start to begin.")
             return
 
@@ -607,8 +616,8 @@ class TelegramService:
 
     async def handle_my_profile(self, chat_id: str) -> None:
         """Show full profile with masked token and inline edit buttons."""
-        user = db.get_user(chat_id)
-        if not user or not db.is_setup_complete(chat_id):
+        user = await db.get_user(chat_id)
+        if not user or not await db.is_setup_complete(chat_id):
             await self.send_message(
                 chat_id,
                 "👤 *My Profile*\n\n"
@@ -664,8 +673,8 @@ class TelegramService:
 
     async def handle_commit_history(self, chat_id: str) -> None:
         """Show paginated commit history with AI decisions."""
-        user = db.get_user(chat_id)
-        if not user or not db.is_setup_complete(chat_id):
+        user = await db.get_user(chat_id)
+        if not user or not await db.is_setup_complete(chat_id):
             await self.send_message(
                 chat_id,
                 "📜 *Commit History*\n\n"
@@ -673,7 +682,7 @@ class TelegramService:
             )
             return
 
-        reviews = db.get_all_reviews_for_user(chat_id, limit=15)
+        reviews = await db.get_all_reviews_for_user(chat_id, limit=15)
 
         if not reviews:
             await self.send_message(
@@ -765,7 +774,7 @@ class TelegramService:
             )
             return -1
 
-        user          = db.get_user(chat_id) or {}
+        user          = await db.get_user(chat_id) or {}
         timeout_hours = user.get("timeout_hours", 24)
         timeout_action = user.get("timeout_action", "accept")
         sha           = commit_metadata.get("sha", "unknown")
@@ -802,7 +811,9 @@ class TelegramService:
             f"———\n\n"
             f"{self.EMOJI['ai']} *AI Assessment*\n\n"
             f"{self._risk_emoji(decision.risk_level)} *Risk:* {decision.risk_level.upper()}\n"
-            f"🎯 *Confidence:* {decision.confidence_score:.0%}\n"
+            f"🛡️ *Safety Score:* {decision.safety_score}/100"
+            + (" ⚠️ _(guardrail-escalated)_" if decision.guardrail_triggered else "") + "\n"
+            f"🎯 *AI Confidence:* {decision.confidence_score:.0%} _(model's confidence in its own verdict)_\n"
             f"📋 *Suggestion:* {decision.suggested_action}\n\n"
             f"📝 *Summary:* {decision.summary}\n\n"
             f"⚠️ *Concerns:*\n{concerns}\n\n"
@@ -904,7 +915,7 @@ class TelegramService:
             if "/" not in repo_full:
                 raise ValueError(f"Missing repo info in commit metadata: {repo_full!r}")
             owner, repo  = repo_full.split("/", 1)
-            user         = db.get_user(chat_id)
+            user         = await db.get_user(chat_id)
             from github_service import GitHubService
             gh           = GitHubService(token=user["github_token"]) if user else None
             repo_context = await gh.fetch_repo_context(owner, repo) if gh else {}
@@ -929,7 +940,7 @@ class TelegramService:
                 chat_id,
                 f"⚠️ *Report Error*\n\n`{self._safe_error(exc)}`\n\n"
                 f"*Basic:* {decision.decision.upper()} | {decision.risk_level.upper()} | "
-                f"{decision.confidence_score:.0%}\n\n{decision.summary}",
+                f"Safety {decision.safety_score}/100\n\n{decision.summary}",
             )
 
     # ── Full codebase analysis ─────────────────────────────────────────────────
@@ -940,8 +951,8 @@ class TelegramService:
         Fetches repo context, sends everything to AI in one compact call,
         then generates a structured .docx report and delivers it.
         """
-        user = db.get_user(chat_id)
-        if not user or not db.is_setup_complete(chat_id):
+        user = await db.get_user(chat_id)
+        if not user or not await db.is_setup_complete(chat_id):
             await self.send_message(
                 chat_id,
                 "⚠️ Please complete setup first — send /start",
@@ -965,7 +976,7 @@ class TelegramService:
             await gh.close()
 
             # All historical reviews for this user
-            reviews = db.get_all_reviews_for_user(chat_id, limit=200)
+            reviews = await db.get_all_reviews_for_user(chat_id, limit=200)
 
             await self.edit_message(chat_id, proc, "🤖 _AI is auditing the entire codebase… (may take ~30s)_")
             analysis = await ai_service.analyze_full_codebase(repo_context, reviews)
@@ -1007,8 +1018,8 @@ class TelegramService:
         asks AI for qualitative assessment, then sends a .docx report.
         No live GitHub API calls needed — uses the local DB only.
         """
-        user = db.get_user(chat_id)
-        if not user or not db.is_setup_complete(chat_id):
+        user = await db.get_user(chat_id)
+        if not user or not await db.is_setup_complete(chat_id):
             await self.send_message(
                 chat_id,
                 "⚠️ Please complete setup first — send /start",
@@ -1023,7 +1034,7 @@ class TelegramService:
         )
 
         try:
-            reviews = db.get_all_reviews_for_user(chat_id, limit=500)
+            reviews = await db.get_all_reviews_for_user(chat_id, limit=500)
             if not reviews:
                 await self.delete_message(chat_id, proc)
                 await self.send_message(
@@ -1568,7 +1579,8 @@ class TelegramService:
         risk_col = RISK_COLOUR.get(decision.risk_level.lower(), BLACK)
         kv("Decision",   decision.decision.upper())
         kv("Risk Level", decision.risk_level.upper(), value_colour=risk_col)
-        kv("Confidence", f"{decision.confidence_score:.0%}")
+        kv("Safety Score", f"{decision.safety_score}/100" + (" (guardrail-escalated)" if decision.guardrail_triggered else ""))
+        kv("AI Confidence", f"{decision.confidence_score:.0%} (model's confidence in its own verdict)")
         kv("Summary",    decision.summary)
         spacer()
 

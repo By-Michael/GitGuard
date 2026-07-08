@@ -1,0 +1,32 @@
+# Local development only — spins up a throwaway Postgres so you don't need
+# a paid Render Postgres instance while developing/testing.
+#
+# Usage:
+#   docker compose up -d
+#   # then in your .env:
+#   DATABASE_URL=postgresql://gitguard:gitguard@localhost:5432/gitguard
+#
+# Data persists in the `pgdata` volume across restarts, but this is NOT
+# what you deploy to Render — on Render you attach a managed Postgres
+# instance and set DATABASE_URL to the connection string Render gives you.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: gitguard
+      POSTGRES_PASSWORD: gitguard
+      POSTGRES_DB: gitguard
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U gitguard"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  pgdata:

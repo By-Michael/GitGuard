@@ -17,25 +17,18 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from config import CONFIG, logger
-
-
-class GitHubServiceError(Exception):
-    pass
-
-class WebhookVerificationError(GitHubServiceError):
-    pass
-
-class GitHubAPIError(GitHubServiceError):
-    pass
-
-class GitHubAuthError(GitHubAPIError):
-    """Raised specifically on 401 Bad credentials — token expired/revoked/malformed.
-    Kept distinct from GitHubAPIError so callers can prompt the user to
-    reconnect instead of showing a generic transient-failure message."""
-    pass
-
-class RollbackError(GitHubServiceError):
-    pass
+from http_utils import DEFAULT_LIMITS, DEFAULT_TIMEOUT, request_with_retry
+# Phase 4: exception classes now live in exceptions.py under a shared
+# GitGuardError base (structured `.category` / `.retryable`). Re-exported
+# here so every existing `from github_service import GitHubAPIError`-style
+# import elsewhere in the codebase keeps working unchanged.
+from exceptions import (  # noqa: F401
+    GitHubServiceError,
+    WebhookVerificationError,
+    GitHubAPIError,
+    GitHubAuthError,
+    RollbackError,
+)
 
 
 class GitHubService:
@@ -54,7 +47,9 @@ class GitHubService:
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None or self._client.is_closed:
-            self._client = httpx.AsyncClient(headers=self.headers, timeout=30.0)
+            self._client = httpx.AsyncClient(
+                headers=self.headers, timeout=DEFAULT_TIMEOUT, limits=DEFAULT_LIMITS,
+            )
         return self._client
 
     async def close(self) -> None:
@@ -83,7 +78,7 @@ class GitHubService:
         client = await self._get_client()
         url = f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/commits/{commit_sha}"
         try:
-            response = await client.get(url)
+            response = await request_with_retry(client, "GET", url)
             response.raise_for_status()
         except httpx.HTTPStatusError as exc:
             if exc.response.status_code == 401:
@@ -134,7 +129,7 @@ class GitHubService:
         }
 
         try:
-            r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}")
+            r = await request_with_retry(client, "GET", f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}")
             if r.status_code == 200:
                 d = r.json()
                 context.update({
@@ -148,7 +143,7 @@ class GitHubService:
             logger.warning("Could not fetch repo metadata: %s", exc)
 
         try:
-            r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/languages")
+            r = await request_with_retry(client, "GET", f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/languages")
             if r.status_code == 200:
                 context["languages"] = r.json()
         except Exception:
@@ -156,7 +151,7 @@ class GitHubService:
 
         branch = context.get("default_branch", default_branch)
         try:
-            r = await client.get(
+            r = await request_with_retry(client, "GET", 
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/trees/{branch}",
                 params={"recursive": "1"},
             )
@@ -170,7 +165,7 @@ class GitHubService:
 
         for name in ["README.md", "README.rst", "README.txt", "README"]:
             try:
-                r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{name}")
+                r = await request_with_retry(client, "GET", f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{name}")
                 if r.status_code == 200 and "content" in r.json():
                     context["readme"] = base64.b64decode(r.json()["content"]).decode("utf-8", errors="replace")[:10000]
                     break
@@ -184,18 +179,41 @@ class GitHubService:
         Fix #15: use path-segment and suffix matching instead of plain substring
         so a pattern like 'build' doesn't accidentally exclude 'src/turbobuild/x.py',
         and '.png' doesn't exclude 'src/mappings.png2.ts'.
+
+        Fix #26: the segment/suffix-only matcher below silently no-ops on any
+        wildcard pattern. CONFIG.excluded_patterns ships with '*.lock',
+        '*.min.js', '*.min.css', and '.tar.gz' — none of which ever matched:
+          - '*.lock' / '*.min.js' / '*.min.css' contain '*', so
+            `p.suffix == pattern` (comparing to a literal string starting
+            with '*') and the segment checks both always evaluate False.
+          - '.tar.gz' is a compound extension. `PurePosixPath.suffix` only
+            returns the LAST suffix (".gz" for "archive.tar.gz"), so the
+            equality check never matched either.
+        Net effect: lockfiles, minified bundles, and tarballs were never
+        excluded, quietly burning the file-context budget on noise that
+        pushed out genuinely useful files. Fixed with proper glob matching
+        (fnmatch) for wildcard patterns and an endswith() check for plain
+        extension patterns so compound extensions work too.
         """
+        import fnmatch
         from pathlib import PurePosixPath
 
         def _matches_pattern(path: str, pattern: str) -> bool:
             p = PurePosixPath(path)
             pattern = pattern.strip()
-            # Match exact segment, suffix, or file extension.
-            return (
-                pattern in p.parts                            # exact segment
-                or p.suffix == pattern                        # file extension (e.g. '.png')
-                or any(part == pattern for part in p.parts)  # full segment match
-            )
+            if not pattern:
+                return False
+            if any(ch in pattern for ch in "*?["):
+                # Glob pattern (e.g. '*.lock', '*.min.js') — match against the
+                # filename and the full path so both 'yarn.lock' and nested
+                # paths like 'vendor/jquery.min.js' are caught.
+                return fnmatch.fnmatch(p.name, pattern) or fnmatch.fnmatch(path, pattern)
+            if pattern.startswith("."):
+                # Extension pattern — endswith() (not p.suffix ==) so compound
+                # extensions like '.tar.gz' match correctly.
+                return path.endswith(pattern)
+            # Plain directory/file segment (e.g. 'node_modules', 'build').
+            return pattern in p.parts
 
         return [
             f for f in files
@@ -205,7 +223,7 @@ class GitHubService:
 
     async def _fetch_single_file(self, client, owner, repo, path) -> Optional[Dict]:
         try:
-            r = await client.get(
+            r = await request_with_retry(client, "GET", 
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/contents/{path}",
                 headers={**self.headers, "Accept": "application/vnd.github.v3.raw"},
             )
@@ -268,7 +286,7 @@ class GitHubService:
 
         # ── 1. Get A and its parent ──────────────────────────────────────────
         try:
-            r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits/{commit_sha}")
+            r = await request_with_retry(client, "GET", f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits/{commit_sha}")
             r.raise_for_status()
             parents = r.json().get("parents", [])
             if not parents:
@@ -279,7 +297,7 @@ class GitHubService:
 
         # ── 2. Get current HEAD ──────────────────────────────────────────────
         try:
-            r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}")
+            r = await request_with_retry(client, "GET", f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}")
             r.raise_for_status()
             head_sha = r.json()["object"]["sha"]
         except httpx.HTTPStatusError as exc:
@@ -290,7 +308,7 @@ class GitHubService:
         # changes removed. If there are conflicts (A and a later commit touched
         # the same lines), the merge API returns 409 and we abort safely.
         try:
-            r = await client.post(
+            r = await request_with_retry(client, "POST", 
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/merges",
                 json={
                     "base":           parent_sha,
@@ -320,7 +338,7 @@ class GitHubService:
 
         # ── 4. Reset the branch back to HEAD (clean up the probe commit) ─────
         try:
-            await client.patch(
+            await request_with_retry(client, "PATCH", 
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
                 json={"sha": head_sha, "force": True},
             )
@@ -329,7 +347,7 @@ class GitHubService:
 
         # ── 5. Create the real revert commit parented onto HEAD ───────────────
         try:
-            r = await client.post(
+            r = await request_with_retry(client, "POST", 
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits",
                 json={
                     "message": (
@@ -350,12 +368,12 @@ class GitHubService:
 
         # ── 6. Advance the branch to the revert commit ───────────────────────
         try:
-            r = await client.patch(
+            r = await request_with_retry(client, "PATCH", 
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
                 json={"sha": new_sha, "force": False},
             )
             if r.status_code == 422:
-                r = await client.patch(
+                r = await request_with_retry(client, "PATCH", 
                     f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
                     json={"sha": new_sha, "force": True},
                 )
@@ -373,7 +391,7 @@ class GitHubService:
         """
         client = await self._get_client()
         try:
-            r = await client.get(f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits/{commit_sha}")
+            r = await request_with_retry(client, "GET", f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/commits/{commit_sha}")
             r.raise_for_status()
             parents = r.json().get("parents", [])
             if not parents:
@@ -383,7 +401,7 @@ class GitHubService:
             raise RollbackError(f"Failed to fetch commit: {exc}") from exc
 
         try:
-            r = await client.patch(
+            r = await request_with_retry(client, "PATCH", 
                 f"{self.GITHUB_API_BASE}/repos/{owner}/{repo}/git/refs/heads/{branch}",
                 json={"sha": parent_sha, "force": True},
             )

@@ -25,7 +25,7 @@ It supports **multiple users** with completely isolated setups. Each person gets
 
 ## Features
 
-- **AI risk scoring** — every commit gets a confidence score, a risk level (low / medium / high / critical), a list of concerns, positive aspects, and specific recommendations, all generated with full awareness of your codebase
+- **AI risk scoring** — every commit gets a deterministic-anchored *safety score*, a risk level (low / medium / high / critical), a list of concerns, positive aspects, and specific recommendations, all generated with full awareness of your codebase. The safety score's band is locked to the risk level (see "How scoring works" below) and can be escalated — never softened — by pattern-based guardrail checks that run independently of the AI on the raw diff.
 - **One-tap rollback** — decline a commit and GitGuard immediately creates a safe revert commit on GitHub, or force-pushes the parent SHA if you prefer that approach
 -**Full Code Analysis** — Trigger deep, multi-file code sweeps on-demand via the Telegram menu to identify architectural flaws, security vulnerabilities, and code debt outside of standard commit triggers
 - **Author Performance** — Track team contribution metrics with AI-driven summaries of commit quality, code stability, and review approval rates per author
@@ -191,29 +191,53 @@ No response within timeout_hours
 
 ---
 
+## How scoring works
+
+Two numbers appear on every review card, and they mean different things:
+
+- **AI Confidence** — how confident the model is in *its own verdict*. This alone used to be shown as if it were a safety score, which is what caused misleading reads (e.g. a one-character change that corrupts a `<?php` tag being scored ~80/100 because the model was confident the tiny diff was harmless).
+- **Safety Score (0-100)** — the number to actually trust. Its band is locked to the risk level (`critical` → 0-24, `high` → 25-54, `medium` → 55-79, `low` → 80-100), so it can never contradict the risk label next to it. Confidence only decides where in that band it lands.
+
+Before the AI-produced risk level is used, `risk_guardrails.py` runs deterministic pattern checks against the **raw diff** (not a summary of it): security-critical paths (`.github/workflows/`, auth, secrets, migrations, `Dockerfile`, `.env`), hardcoded-credential patterns, security controls being disabled (`verify=False`, `DEBUG=True`, etc.), and structural corruption signals (e.g. a removed `<?php`/`?>` tag, or an unbalanced bracket delta within the visible diff). These checks can only push risk **up** and force a `decline`, never soften what the model said — a false positive here just adds an extra concern for you to read; a false negative from the model gets caught.
+
+The same guardrail module also runs against whole-file contents during **Full Code Analysis** (flagging any committed secret regardless of what the model notices in a truncated preview) and the numeric fields in both **Full Code Analysis** and **Author Analysis** reports (commit counts, decline rates, etc.) are computed locally from the database and overwritten onto the AI's response rather than trusted from the model's own restatement of the same numbers — this avoids miscounts once there's more than a handful of commits/authors in the prompt.
+
+---
+
+## Reliability (Phase 4)
+
+- **Shared exception hierarchy** (`exceptions.py`) — every exception the app raises on purpose (GitHub/AI/Telegram/database/job failures) inherits from `GitGuardError`, carrying a `category` (github/ai/telegram/database/jobs) and `retryable` flag, instead of being ad-hoc per module.
+- **Structured logging** — set `LOG_FORMAT=json` (the Render blueprint below does this) to emit one JSON object per log line, including the failure `category` when the active exception is a `GitGuardError`. Leave unset for the original human-readable format during local dev.
+- **Admin alerting on repeated failures** (`alerting.py`) — separate from the existing per-user "your commit failed" notice, this watches for a *pattern* (e.g. Groq or GitHub being down for everyone) and pings `ADMIN_CHAT_ID` once a failure category crosses `ALERT_FAILURE_THRESHOLD` within `ALERT_WINDOW_SECONDS`, then goes quiet for `ALERT_COOLDOWN_SECONDS` so a sustained outage doesn't spam the chat. Unset `ADMIN_CHAT_ID` disables sending (a warning is logged instead).
+
+---
+
 ## Database
 
-GitGuard uses a local SQLite file (`commit_guardian.db`) with two tables:
+GitGuard uses Postgres (via `asyncpg`, connection-pooled) — a `DATABASE_URL` is required. Two main tables:
 
-- **`users`** — one row per Telegram user, storing their GitHub token, webhook secret, repo, branch, timeout preferences, and onboarding state. The webhook secret is generated automatically during onboarding and is unique per user.
-- **`active_reviews`** — one row per commit currently under review, storing the full commit metadata and AI decision as JSON so they can be replayed if needed.
+- **`users`** — one row per Telegram user: GitHub token, webhook secret, repo, branch, timeout preferences, onboarding state.
+- **`active_reviews`** — one row per commit currently under review, storing commit metadata and the AI decision as JSON.
+- **`jobs`** — the crash-safe queue (Phase 3) that commit processing runs off, so an in-flight analysis survives a restart/redeploy.
 
-The database uses WAL journal mode for better concurrent read performance and thread-local connections to stay safe with asyncio.
+For local development, `docker-compose up -d` spins up a throwaway Postgres — see `docker-compose.yml`.
 
 ---
 
 ## Deploying to Render
 
-Render works well for this because it gives you a persistent public URL out of the box.
+The included `render.yaml` blueprint (Phase 5) wires this up for you in one step:
 
 1. Push your code to a GitHub repo
-2. Create a new **Web Service** on Render pointing at that repo
-3. Set the start command to `uvicorn webhook_server:app --host 0.0.0.0 --port $PORT`
-4. Add your three environment variables in the Render dashboard
-5. Set `PUBLIC_URL` to the Render URL Render assigns you (e.g. `https://gitguard.onrender.com`)
+2. In the Render dashboard: **New +** → **Blueprint**, point it at your repo
+3. Render provisions a `starter`-plan web service and a `basic-256mb`-plan Postgres instance, and wires `DATABASE_URL` and `PUBLIC_URL` between them automatically
+4. Set the two secrets Render will prompt you for: `TELEGRAM_BOT_TOKEN` and `GROQ_API_KEY`
+5. (Optional) Set `ADMIN_CHAT_ID` to your own Telegram chat_id to receive admin alerts on repeated failures
 6. Deploy
 
-Note: Render's free tier spins down after inactivity. If you need the timeout worker to fire reliably, use a paid instance or an always-on server.
+**Note on cost:** the free web-service tier spins down on idle, which breaks the timeout worker and job workers (they need the process to stay running between webhook events) — this is why the blueprint uses the `starter` (always-on) compute plan. There's no free managed-Postgres tier on Render anymore either; `basic-256mb` is the cheapest paid tier that works here.
+
+If you'd rather set this up manually instead of using the blueprint, the manual steps are the same as above minus the one-click provisioning — create the web service and Postgres instance separately in the dashboard and copy the connection string into `DATABASE_URL` yourself.
 
 ---
 

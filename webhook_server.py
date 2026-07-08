@@ -13,44 +13,58 @@ import json
 import traceback
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional
 
 import httpx
 from fastapi import FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import JSONResponse
 
+import alerting
 import database as db
 from ai_service import CommitDecision, ai_service
 from config import CONFIG, logger
 from github_service import GitHubAuthError, GitHubService, GitHubServiceError, RollbackError, WebhookVerificationError
+from job_worker import start_job_workers, stop_job_workers
 from telegram_service import TelegramAPIError, telegram_service
 from timeout_worker import run_timeout_worker
-
-# Fix #21: track all in-flight background tasks so we can drain them on shutdown.
-_background_tasks: Set[asyncio.Task] = set()
-
-def _track_task(coro) -> asyncio.Task:
-    task = asyncio.create_task(coro)
-    _background_tasks.add(task)
-    task.add_done_callback(_background_tasks.discard)
-    return task
 
 
 # Fix #4: per-commit asyncio locks prevent the double-press / double-rollback race.
 # Locks are pruned after use to prevent unbounded dict growth on long-running servers.
+#
+# Fix #27: pruning used to check `not lock.locked()` right after release, which
+# race-loses to a waiter that hasn't been scheduled to re-acquire yet:
+#
+#   A holds lock -> B calls _get_review_lock(sha), gets the SAME Lock object,
+#   blocks on acquire() -> A releases and (synchronously, before B's
+#   continuation runs) checks lock.locked(), sees False, and pops the dict
+#   entry -> C now calls _get_review_lock(sha), finds no entry, and creates a
+#   BRAND NEW unlocked Lock -> C acquires the new lock immediately while B is
+#   still about to acquire the old (now orphaned) one -> B and C both run
+#   inside "the lock" concurrently. Reproduced directly with two tasks
+#   overlapping their critical sections despite the lock.
+#
+# Fixed with explicit reference counting: only drop the dict entry once no
+# coroutine holds a reference to that specific Lock instance, instead of
+# inferring safety from a point-in-time locked() check.
 _review_locks: Dict[str, asyncio.Lock] = {}
+_review_lock_refs: Dict[str, int] = {}
 
 def _get_review_lock(commit_sha: str) -> asyncio.Lock:
     if commit_sha not in _review_locks:
         _review_locks[commit_sha] = asyncio.Lock()
+        _review_lock_refs[commit_sha] = 0
+    _review_lock_refs[commit_sha] += 1
     return _review_locks[commit_sha]
 
 def _release_review_lock(commit_sha: str) -> None:
-    """Prune the lock entry once we're done with it to avoid unbounded growth."""
-    lock = _review_locks.get(commit_sha)
-    # Only remove if the lock is currently free (no other waiter holds it).
-    if lock is not None and not lock.locked():
+    """Drop our reference; prune the entry only when no one else holds one."""
+    remaining = _review_lock_refs.get(commit_sha, 1) - 1
+    if remaining <= 0:
+        _review_lock_refs.pop(commit_sha, None)
         _review_locks.pop(commit_sha, None)
+    else:
+        _review_lock_refs[commit_sha] = remaining
 
 
 # ──────────────────────────────────────────────
@@ -59,22 +73,37 @@ def _release_review_lock(commit_sha: str) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    db.init_db()
+    try:
+        await db.init_db()
+    except Exception:
+        # Fail loudly and immediately: a web service that comes up "healthy"
+        # without a working DB pool will 500 on every request instead of
+        # refusing to boot. Render will show this in deploy logs and mark
+        # the deploy failed, which is what you want here.
+        logger.critical("Could not connect to Postgres at startup — aborting boot", exc_info=True)
+        raise
     logger.info("Commit Guardian v5 starting — multi-user + timeout worker")
+    # Phase 3: any job still 'processing' here is a leftover from a crash —
+    # reset it to 'pending' before workers start so it resumes automatically
+    # instead of sitting orphaned forever.
+    await db.reset_stuck_jobs()
     # Fix #19: auto-register the Telegram webhook so the bot survives redeployments.
     await _register_telegram_webhook()
     cleanup_task = asyncio.create_task(_cleanup_loop())
     timeout_task = asyncio.create_task(run_timeout_worker())
+    job_tasks = start_job_workers()
     yield
     logger.info("Shutting down…")
     cleanup_task.cancel()
     timeout_task.cancel()
-    # Fix #21: drain in-flight commit-processing tasks before exit so no
-    # commit is left with a "🔄 Fetching…" message and no DB record.
-    if _background_tasks:
-        logger.info("Waiting for %d in-flight tasks to finish (max 30 s)…", len(_background_tasks))
-        await asyncio.wait(_background_tasks, timeout=30)
+    # Phase 3: give in-flight jobs a short grace period to finish, then
+    # cancel. Unlike before, a job interrupted here isn't lost — it's left
+    # (or put back) in 'processing'/'pending' and reset_stuck_jobs() picks
+    # it up again on the next boot.
+    await stop_job_workers(job_tasks)
     await telegram_service.close()
+    await ai_service.close()
+    await db.close()
 
 
 async def _register_telegram_webhook() -> None:
@@ -105,7 +134,7 @@ async def _register_telegram_webhook() -> None:
 async def _cleanup_loop() -> None:
     while True:
         await asyncio.sleep(3600)
-        removed = db.cleanup_old_reviews(hours=48)
+        removed = await db.cleanup_old_reviews(hours=48)
         if removed:
             logger.info("Cleaned up %d old resolved reviews", removed)
 
@@ -119,7 +148,24 @@ app = FastAPI(title="Commit Guardian", version="5.0.0", lifespan=lifespan)
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy", "version": "5.0.0"}
+    """
+    Checks the Postgres pool with a real round-trip query, not just
+    "did the process start." Render (and any uptime monitor) should point
+    at this so a broken DB connection shows as unhealthy instead of a
+    silently-500ing service that still passes health checks.
+    """
+    try:
+        await db._require_pool().fetchval("SELECT 1")
+        db_ok = True
+    except Exception as exc:
+        logger.error("Health check DB probe failed: %s", exc)
+        db_ok = False
+
+    status_code = 200 if db_ok else 503
+    return JSONResponse(
+        status_code=status_code,
+        content={"status": "healthy" if db_ok else "unhealthy", "version": "5.0.0", "database": "up" if db_ok else "down"},
+    )
 
 @app.get("/")
 async def root():
@@ -147,8 +193,8 @@ async def github_webhook(
     if x_github_event != "push":
         return {"status": "ignored"}
 
-    user = db.get_user(chat_id)
-    if not user or not db.is_setup_complete(chat_id):
+    user = await db.get_user(chat_id)
+    if not user or not await db.is_setup_complete(chat_id):
         # Return 200 to prevent GitHub retrying — user just isn't set up
         logger.warning("Webhook for unknown/incomplete user %s — ignoring", chat_id)
         return {"status": "ignored", "reason": "user not configured"}
@@ -201,7 +247,7 @@ async def github_webhook(
 
     # Fix #18: cap pending reviews per user to prevent Telegram flood.
     MAX_PENDING_PER_USER = 5
-    pending = db.get_active_reviews_for_user(chat_id)
+    pending = await db.get_active_reviews_for_user(chat_id)
     if len(pending) >= MAX_PENDING_PER_USER:
         logger.warning("User %s hit pending review cap (%d) — skipping push", chat_id, MAX_PENDING_PER_USER)
         return {"status": "ignored", "reason": "too many pending reviews"}
@@ -212,13 +258,23 @@ async def github_webhook(
             continue
         # Fix #3: use an atomic DB insert as the dedup gate instead of
         # read-then-write (which races on GitHub webhook retries).
-        if db.try_queue_sha(sha, chat_id):
-            _track_task(
-                process_commit(
-                    chat_id, user["github_token"],
-                    owner, repo, sha,
-                    pusher.get("name", "Unknown"), pusher.get("email", "N/A"), branch,
-                )
+        if await db.try_queue_sha(sha, chat_id):
+            # Phase 3: durable job row instead of a bare asyncio.create_task —
+            # survives a process crash/restart. github_token is deliberately
+            # NOT stored in the payload; the job worker looks it up fresh at
+            # run time so a /reconnect between queueing and processing is
+            # picked up automatically.
+            await db.create_job(
+                "process_commit",
+                {
+                    "chat_id": chat_id,
+                    "owner": owner,
+                    "repo": repo,
+                    "commit_sha": sha,
+                    "pusher_name": pusher.get("name", "Unknown"),
+                    "pusher_email": pusher.get("email", "N/A"),
+                    "branch": branch,
+                },
             )
             queued += 1
 
@@ -228,22 +284,6 @@ async def github_webhook(
 # ──────────────────────────────────────────────
 # Commit Processing Pipeline
 # ──────────────────────────────────────────────
-
-async def process_commit(
-    chat_id, github_token, owner, repo,
-    commit_sha, pusher_name, pusher_email, branch,
-) -> None:
-    try:
-        await _process_commit_inner(
-            chat_id, github_token, owner, repo,
-            commit_sha, pusher_name, pusher_email, branch,
-        )
-    except Exception as exc:
-        logger.error(
-            "Unhandled error for %s: %s\n%s",
-            commit_sha[:7], exc, traceback.format_exc(),
-        )
-
 
 async def _process_commit_inner(
     chat_id, github_token, owner, repo,
@@ -262,7 +302,7 @@ async def _process_commit_inner(
         await telegram_service.delete_message(chat_id, proc)
         # Only alert once per cooldown window — every webhook push hitting a
         # broken token would otherwise spam the user with identical messages.
-        if db.should_send_token_alert(chat_id):
+        if await db.should_send_token_alert(chat_id):
             await telegram_service.send_message(
                 chat_id,
                 f"🔑 *GitHub token no longer works*\n\n"
@@ -272,10 +312,11 @@ async def _process_commit_inner(
                 "Send /reconnect to paste a fresh token — your repo, branch, and "
                 "timeout settings will be kept.",
             )
-            db.mark_token_alert_sent(chat_id)
+            await db.mark_token_alert_sent(chat_id)
         await gh.close()
         return
     except GitHubServiceError as exc:
+        await alerting.record_failure(exc, detail=f"fetch_commit_metadata {owner}/{repo}@{commit_sha[:7]}: {exc}")
         await telegram_service.delete_message(chat_id, proc)
         await telegram_service.send_message(
             chat_id,
@@ -320,6 +361,7 @@ async def _process_commit_inner(
         )
         decision = await ai_service.analyze_commit(commit_metadata, repo_context)
     except Exception as exc:
+        await alerting.record_failure(exc, detail=f"analyze_commit {commit_sha[:7]}: {exc}")
         await telegram_service.delete_message(chat_id, proc)
         await telegram_service.send_message(
             chat_id,
@@ -356,7 +398,7 @@ async def _process_commit_inner(
         await gh.close()
         return
 
-    db.save_review(
+    await db.save_review(
         commit_sha       = commit_sha,
         chat_id          = chat_id,
         owner            = owner,
@@ -456,12 +498,12 @@ async def telegram_webhook(request: Request):
 
 
 async def _handle_status(chat_id: str) -> None:
-    user = db.get_user(chat_id)
+    user = await db.get_user(chat_id)
     if not user:
         await telegram_service.send_message(chat_id, "Send /start to get set up first.")
         return
 
-    reviews        = db.get_active_reviews_for_user(chat_id)
+    reviews        = await db.get_active_reviews_for_user(chat_id)
     timeout_hours  = user.get("timeout_hours", 24)
     timeout_action = user.get("timeout_action", "accept")
     timeout_str    = "Disabled" if (timeout_hours == 0 or timeout_action == "none") \
@@ -525,7 +567,7 @@ async def _handle_callback(callback_query: Dict[str, Any]) -> None:
         if action == "restart":
             await telegram_service.handle_start(chat_id)
         elif action == "timeout":
-            db.upsert_user(chat_id, onboard_step="await_timeout_hours")
+            await db.upsert_user(chat_id, onboard_step="await_timeout_hours")
             await telegram_service.send_message(
                 chat_id,
                 "⏰ *Change Timeout*\n\nHow many hours before I auto-act?\n_(Send `0` to disable)_",
@@ -539,13 +581,13 @@ async def _handle_callback(callback_query: Dict[str, Any]) -> None:
         if action == "token":
             await telegram_service.handle_reconnect(chat_id)
         elif action == "branch":
-            db.upsert_user(chat_id, onboard_step="await_branch_update")
+            await db.upsert_user(chat_id, onboard_step="await_branch_update")
             await telegram_service.send_message(
                 chat_id,
                 "🔀 *Change Branch*\n\nWhich branch should I monitor?\n_(Type name or send `main`)_",
             )
         elif action == "timeout":
-            db.upsert_user(chat_id, onboard_step="await_timeout_hours")
+            await db.upsert_user(chat_id, onboard_step="await_timeout_hours")
             await telegram_service.send_message(
                 chat_id,
                 "⏰ *Change Timeout*\n\nHow many hours before I auto-act?\n_(Send `0` to disable)_",
@@ -566,7 +608,7 @@ async def _handle_callback(callback_query: Dict[str, Any]) -> None:
         await telegram_service.answer_callback(cq_id, f"Unknown action: {action_code}", show_alert=True)
         return
 
-    review = db.get_review(commit_sha)
+    review = await db.get_review(commit_sha, chat_id)
     if not review:
         await telegram_service.answer_callback(
             cq_id, "Review not found — it may have been deleted.", show_alert=True
@@ -601,7 +643,7 @@ async def _handle_callback(callback_query: Dict[str, Any]) -> None:
         suggested_action = decision_dict.get("suggested_action", ""),
     )
 
-    user = db.get_user(chat_id)
+    user = await db.get_user(chat_id)
     if not user:
         await telegram_service.answer_callback(cq_id, "User not found.", show_alert=True)
         return
@@ -611,76 +653,90 @@ async def _handle_callback(callback_query: Dict[str, Any]) -> None:
     # Fix #4: acquire a per-commit lock before reading resolved state and acting.
     # This serialises concurrent taps (double-tap on mobile, network retry) so
     # the resolved check → action sequence is atomic within this process.
-    async with _get_review_lock(commit_sha):
-        # Re-read review inside the lock — another coroutine may have resolved it
-        # between the outer check and lock acquisition.
-        review = db.get_review(commit_sha)
-        if not review or review.get("resolved"):
-            await telegram_service.answer_callback(
-                cq_id,
-                "This review was already resolved — no action taken.",
-                show_alert=True,
-            )
-            await gh.close()
-            return
-
-        try:
-            if action == "accept":
-                async def on_accept() -> None:
-                    db.resolve_review(commit_sha, "accepted")
-
-                await telegram_service.handle_accept(
-                    chat_id, cq_id, message_id, commit_metadata, decision, on_accept
+    #
+    # Fix #28: the early `return` below (already-resolved / stale review) used
+    # to sit *inside* the `async with` block while `_release_review_lock()`
+    # was called only *after* it — so that return path skipped the release
+    # call entirely. That's not just a rare edge case, it's the review's
+    # normal double-tap path (an already-resolved card being tapped again),
+    # so every such tap permanently leaked one dict entry — reproduced 500/500
+    # leaked entries across 500 simulated double-taps. The whole point of
+    # `_get_review_lock`/`_release_review_lock` was to avoid unbounded dict
+    # growth; wrapping the section in try/finally guarantees the release call
+    # always runs exactly once per acquire, regardless of which branch returns.
+    lock = _get_review_lock(commit_sha)
+    try:
+        async with lock:
+            # Re-read review inside the lock — another coroutine may have resolved it
+            # between the outer check and lock acquisition.
+            review = await db.get_review(commit_sha, chat_id)
+            if not review or review.get("resolved"):
+                await telegram_service.answer_callback(
+                    cq_id,
+                    "This review was already resolved — no action taken.",
+                    show_alert=True,
                 )
+                await gh.close()
+                return
 
-            elif action == "decline":
-                # Guard: check if any later commits were already accepted on this branch.
-                # Declining A when B (accepted) is stacked on top would wipe B's changes
-                # even with the improved revert logic, if there are file conflicts.
-                # Warn the user explicitly so they can make an informed decision.
-                review_created_at = review.get("created_at", "")
-                accepted_on_top = db.get_accepted_reviews_after(chat_id, review_created_at)
-                if accepted_on_top:
-                    shas = ", ".join(f"`{r['commit_sha'][:7]}`" for r in accepted_on_top[:3])
-                    await telegram_service.answer_callback(
-                        cq_id,
-                        f"⚠️ Accepted commits exist on top ({shas}). "
-                        "Rollback may conflict — see chat for details.",
-                        show_alert=True,
-                    )
-                    await telegram_service.send_message(
-                        chat_id,
-                        f"⚠️ *Stacked Commit Warning*\n\n"
-                        f"You're declining `{commit_sha[:7]}` but the following commits "
-                        f"were already accepted on top of it:\n\n"
-                        + "\n".join(f"• `{r['commit_sha'][:7]}` — {r.get('status','accepted')}" for r in accepted_on_top[:5])
-                        + f"\n\nRollback will attempt a safe surgical revert. "
-                        f"If there are conflicts, it will abort automatically rather than "
-                        f"wipe the accepted commits. Proceeding…",
+            try:
+                if action == "accept":
+                    async def on_accept() -> None:
+                        await db.resolve_review(commit_sha, chat_id, "accepted")
+
+                    await telegram_service.handle_accept(
+                        chat_id, cq_id, message_id, commit_metadata, decision, on_accept
                     )
 
-                async def on_decline() -> Dict[str, Any]:
-                    try:
-                        result = await gh.rollback_commit(
-                            review["owner"], review["repo"], commit_sha, branch=review["branch"]
+                elif action == "decline":
+                    # Guard: check if any later commits were already accepted on this branch.
+                    # Declining A when B (accepted) is stacked on top would wipe B's changes
+                    # even with the improved revert logic, if there are file conflicts.
+                    # Warn the user explicitly so they can make an informed decision.
+                    review_created_at = review.get("created_at", "")
+                    accepted_on_top = await db.get_accepted_reviews_after(chat_id, review_created_at)
+                    if accepted_on_top:
+                        shas = ", ".join(f"`{r['commit_sha'][:7]}`" for r in accepted_on_top[:3])
+                        await telegram_service.answer_callback(
+                            cq_id,
+                            f"⚠️ Accepted commits exist on top ({shas}). "
+                            "Rollback may conflict — see chat for details.",
+                            show_alert=True,
                         )
-                        return result
-                    finally:
-                        db.resolve_review(commit_sha, "declined")
+                        await telegram_service.send_message(
+                            chat_id,
+                            f"⚠️ *Stacked Commit Warning*\n\n"
+                            f"You're declining `{commit_sha[:7]}` but the following commits "
+                            f"were already accepted on top of it:\n\n"
+                            + "\n".join(f"• `{r['commit_sha'][:7]}` — {r.get('status','accepted')}" for r in accepted_on_top[:5])
+                            + f"\n\nRollback will attempt a safe surgical revert. "
+                            f"If there are conflicts, it will abort automatically rather than "
+                            f"wipe the accepted commits. Proceeding…",
+                        )
 
-                await telegram_service.handle_decline(
-                    chat_id, cq_id, message_id, commit_metadata, decision, on_decline
-                )
+                    async def on_decline() -> Dict[str, Any]:
+                        try:
+                            result = await gh.rollback_commit(
+                                review["owner"], review["repo"], commit_sha, branch=review["branch"]
+                            )
+                            return result
+                        finally:
+                            await db.resolve_review(commit_sha, chat_id, "declined")
 
-            elif action == "report":
-                # Report doesn't resolve — user can still Accept/Decline after
-                await telegram_service.handle_report(chat_id, cq_id, commit_metadata, decision)
+                    await telegram_service.handle_decline(
+                        chat_id, cq_id, message_id, commit_metadata, decision, on_decline
+                    )
 
-        finally:
-            await gh.close()
+                elif action == "report":
+                    # Report doesn't resolve — user can still Accept/Decline after
+                    await telegram_service.handle_report(chat_id, cq_id, commit_metadata, decision)
 
-    # Prune the lock entry now that we're done — prevents unbounded dict growth.
-    _release_review_lock(commit_sha)
+            finally:
+                await gh.close()
+    finally:
+        # Prune the lock entry now that we're done — prevents unbounded dict growth.
+        # Always runs, whichever branch above returned (see Fix #28 note above).
+        _release_review_lock(commit_sha)
 
 
 # ──────────────────────────────────────────────
@@ -693,6 +749,7 @@ async def global_error(request: Request, exc: Exception):
         "Unhandled: %s %s — %s\n%s",
         request.method, request.url.path, exc, traceback.format_exc(),
     )
+    await alerting.record_failure(exc, detail=f"{request.method} {request.url.path}: {exc}")
     return JSONResponse(status_code=500, content={"error": str(exc)[:200]})
 
 
