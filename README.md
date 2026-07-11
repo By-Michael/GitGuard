@@ -251,6 +251,6 @@ If you'd rather set this up manually instead of using the blueprint, the manual 
 
 ## License
 
-Copyright © 2026. All rights reserved.
+Copyright © 2026 Michael Defaru. All rights reserved.
 
 This project is proprietary and closed-source. Unauthorized copying, modification, distribution, or commercial use of this software, via any medium, is strictly prohibited.
