@@ -253,4 +253,8 @@ If you'd rather set this up manually instead of using the blueprint, the manual 
 
 Copyright © 2026 Michael Defaru. All rights reserved.
 
-This project is proprietary and closed-source. Unauthorized copying, modification, distribution, or commercial use of this software, via any medium, is strictly prohibited.
+This project is proprietary and closed-source. It is shared publicly strictly for portfolio review and educational evaluation.
+
+Permissions: Recruiters, hiring managers, and engineers are authorized to view, clone, and test this repository locally for the sole purpose of evaluating my candidacy for employment.
+
+Restrictions: Any other use—including commercial deployment, modification, or unauthorized public distribution—is strictly prohibited.
