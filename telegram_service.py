@@ -112,6 +112,23 @@ class TelegramService:
         msg = re.sub(r"token [A-Za-z0-9_]{10,}", "token [REDACTED]", msg)
         return msg[:300]
 
+    # Characters that are special in Telegram's legacy "Markdown" parse
+    # mode. Any of these appearing *unescaped* inside dynamic content (a
+    # commit message, filename, or AI-generated concern/summary) makes
+    # Telegram reject the whole message with 400 "can't parse entities" —
+    # which is what was silently dropping review cards in production.
+    _MD_SPECIAL = re.compile(r"([_*`\[])")
+
+    @classmethod
+    def _md_escape(cls, text: Any) -> str:
+        """Escape Telegram legacy-Markdown special characters in text that
+        comes from outside our own hardcoded formatting (commit messages,
+        author names, filenames, AI-generated summaries/concerns/etc.) so
+        it can never be mistaken for (unbalanced) formatting markup."""
+        if text is None:
+            return ""
+        return cls._MD_SPECIAL.sub(r"\\\1", str(text))
+
     def _risk_emoji(self, risk_level: str) -> str:
         return {
             "critical": self.EMOJI["risk_critical"],
@@ -147,6 +164,27 @@ class TelegramService:
         try:
             client   = await self._get_client()
             response = await request_with_retry(client, "POST", retry_after_getter=_telegram_retry_after, url=f"{self.base_url}/sendMessage", json=payload)
+            # Fix: a single unescaped/unbalanced Markdown character anywhere
+            # in dynamic content (commit message, AI-generated text, a
+            # filename with an underscore, ...) makes Telegram reject the
+            # *entire* message with 400 "can't parse entities" — this was
+            # silently dropping review cards. Callers now escape what they
+            # can (see _md_escape), but as a last-resort safety net, retry
+            # once as plain text so the message still reaches the user
+            # (with literal *`_[ characters) instead of vanishing.
+            if response.status_code == 400 and parse_mode is not None:
+                try:
+                    desc = response.json().get("description", "")
+                except Exception:
+                    desc = ""
+                if "can't parse entities" in desc.lower():
+                    logger.warning(
+                        "Telegram rejected Markdown entities for chat %s (%s) — retrying as plain text",
+                        chat_id, desc,
+                    )
+                    payload["parse_mode"] = None
+                    payload.pop("parse_mode")
+                    response = await request_with_retry(client, "POST", retry_after_getter=_telegram_retry_after, url=f"{self.base_url}/sendMessage", json=payload)
             response.raise_for_status()
             result = response.json()
             if not result.get("ok"):
@@ -781,15 +819,20 @@ class TelegramService:
         files         = commit_metadata.get("files", [])
         stats         = commit_metadata.get("stats", {})
 
+        # Fix: filenames, the commit message, and AI-generated text are all
+        # untrusted/dynamic strings that can contain Markdown special
+        # characters (an underscore in a filename, a backtick in a
+        # concern, etc.). Escape each one individually — everything else
+        # in this template is our own literal formatting and stays as-is.
         files_summary = "\n".join(
-            f"  `{f['filename']}` ({f['status']}, +{f['additions']}/-{f['deletions']})"
+            f"  `{self._md_escape(f['filename'])}` ({f['status']}, +{f['additions']}/-{f['deletions']})"
             for f in files[:15]
         )
         if len(files) > 15:
             files_summary += f"\n  … and {len(files) - 15} more"
 
-        concerns  = "\n".join(f"  • {c}" for c in decision.concerns[:5])       or "  None"
-        positives = "\n".join(f"  • {p}" for p in decision.positive_aspects[:5]) or "  None"
+        concerns  = "\n".join(f"  • {self._md_escape(c)}" for c in decision.concerns[:5])         or "  None"
+        positives = "\n".join(f"  • {self._md_escape(p)}" for p in decision.positive_aspects[:5]) or "  None"
 
         if timeout_hours == 0 or timeout_action == "none":
             timeout_notice = "_No auto-action — this review won't expire._"
@@ -799,23 +842,29 @@ class TelegramService:
                 f"will auto-*{timeout_action}*._"
             )
 
+        # `message` is embedded inside a ``` fenced block, where Telegram's
+        # legacy Markdown doesn't parse nested entities — no escaping
+        # needed there, but a stray ``` in the commit message itself could
+        # still close the fence early, so strip those specifically.
+        safe_message = commit_metadata.get("message", "")[:300].replace("```", "'''")
+
         text = (
             f"{self.EMOJI['commit']} *New Commit Requires Review*\n\n"
-            f"{self.EMOJI['user']} *Author:* {commit_metadata.get('author_name','Unknown')}"
-            f" (`{commit_metadata.get('author_email','N/A')}`)\n"
+            f"{self.EMOJI['user']} *Author:* {self._md_escape(commit_metadata.get('author_name','Unknown'))}"
+            f" (`{self._md_escape(commit_metadata.get('author_email','N/A'))}`)\n"
             f"{self.EMOJI['clock']} *Committed:* {commit_metadata.get('committed_at','N/A')}\n"
             f"{self.EMOJI['commit']} *SHA:* `{sha[:7]}`\n"
             f"{self.EMOJI['files']} *Files:* {len(files)} changed  "
             f"(+{stats.get('additions',0)} / -{stats.get('deletions',0)} lines)\n\n"
-            f"💬 *Message:*\n```\n{commit_metadata.get('message','')[:300]}\n```\n\n"
+            f"💬 *Message:*\n```\n{safe_message}\n```\n\n"
             f"———\n\n"
             f"{self.EMOJI['ai']} *AI Assessment*\n\n"
             f"{self._risk_emoji(decision.risk_level)} *Risk:* {decision.risk_level.upper()}\n"
             f"🛡️ *Safety Score:* {decision.safety_score}/100"
             + (" ⚠️ _(guardrail-escalated)_" if decision.guardrail_triggered else "") + "\n"
             f"🎯 *AI Confidence:* {decision.confidence_score:.0%} _(model's confidence in its own verdict)_\n"
-            f"📋 *Suggestion:* {decision.suggested_action}\n\n"
-            f"📝 *Summary:* {decision.summary}\n\n"
+            f"📋 *Suggestion:* {self._md_escape(decision.suggested_action)}\n\n"
+            f"📝 *Summary:* {self._md_escape(decision.summary)}\n\n"
             f"⚠️ *Concerns:*\n{concerns}\n\n"
             f"✨ *Positives:*\n{positives}\n\n"
             f"———\n*Changed Files:*\n{files_summary}\n\n"
@@ -836,9 +885,23 @@ class TelegramService:
         }
         # Bug 3 fix: Telegram hard limit is 4096 chars. Truncate the body (not
         # the buttons) so the card always sends even on large commits.
+        #
+        # Cutting at an arbitrary character offset (the old behavior) could
+        # land inside a *bold*/_italic_/`code`/```fence``` entity, leaving
+        # it unbalanced — Telegram then rejects the *whole* message with
+        # 400 "can't parse entities" rather than just showing it truncated.
+        # Cut at the last safe line boundary instead, and if that landed
+        # inside the fenced commit-message block, close the fence so the
+        # rest of the message can't be swallowed as "code".
         MAX_TELEGRAM = 4000  # leave headroom for markup overhead
         if len(text) > MAX_TELEGRAM:
-            text = text[:MAX_TELEGRAM] + "\n\n_…message truncated_"
+            cutoff = text.rfind("\n", 0, MAX_TELEGRAM)
+            if cutoff < MAX_TELEGRAM // 2:  # no reasonable newline found — fall back
+                cutoff = MAX_TELEGRAM
+            truncated = text[:cutoff]
+            if truncated.count("```") % 2 == 1:
+                truncated += "\n```"
+            text = truncated + "\n\n_…message truncated_"
 
         return await self.send_message(chat_id, text, reply_markup=keyboard)
 

@@ -77,6 +77,25 @@ class AIService:
     # users push simultaneously.
     _semaphore = asyncio.Semaphore(5)
 
+    # Bug fix (recurring "HTTP 413 Request too large ... tokens per minute"):
+    # the prompt builder used to cap each *piece* of context (2000 chars per
+    # file patch, 1500 chars per key file, etc.) but never capped the *sum*.
+    # A commit touching many files, or a large README/tree, could easily
+    # assemble a 50-100k+ character prompt — 15-25k+ tokens — against a
+    # 12000 TPM account limit, and Groq rejected the whole request outright.
+    # These constants turn that into a single, enforced total budget instead
+    # of a pile of uncoordinated local caps.
+    #
+    # 3.0 is a deliberately conservative (low) chars-per-token estimate —
+    # diffs and code are punctuation/symbol-heavy and tokenize *more*
+    # densely than prose, so lowballing this means the real token count
+    # from Groq's tokenizer should always come in under our estimate, not
+    # over it.
+    CHARS_PER_TOKEN = 3.0
+    # Tokens held back from the raw TPM limit for JSON-mode formatting
+    # overhead, tokenizer variance, and normal minute-boundary jitter.
+    SAFETY_MARGIN_TOKENS = 500
+
     def __init__(self) -> None:
         self.api_key = CONFIG.groq_api_key
         self.model = CONFIG.groq_model
@@ -234,34 +253,99 @@ class AIService:
             7. If you see anything suspicious (backdoors, credential leaks, malicious code), set decision to "decline" and risk_level to "critical"
         """)
 
+    def _prompt_char_budget(self, system_prompt: str) -> int:
+        """
+        Total character budget for the *dynamic* content of the user prompt
+        (commit diffs + repo context), sized so that
+        system_prompt + user_prompt + completion tokens stays safely under
+        the account's Groq TPM limit — regardless of how many files a
+        commit touches or how large the repo's README/tree are.
+        """
+        total_token_budget = CONFIG.groq_tpm_limit - self.max_tokens - self.SAFETY_MARGIN_TOKENS
+        system_tokens = len(system_prompt) / self.CHARS_PER_TOKEN
+        user_prompt_token_budget = total_token_budget - system_tokens
+        # Always leave at least a small usable budget rather than going
+        # negative if max_tokens itself is configured close to the TPM
+        # limit — a degraded-but-working analysis beats a hard failure.
+        user_prompt_token_budget = max(400, user_prompt_token_budget)
+        return int(user_prompt_token_budget * self.CHARS_PER_TOKEN)
+
+    @staticmethod
+    def _split_budget(count: int, total_budget: int, per_item_overhead: int, min_each: int) -> int:
+        """Even per-item content budget once a fixed per-item overhead
+        (headers, fences, etc.) is subtracted, so N items can never blow
+        past total_budget regardless of how large N gets."""
+        if count <= 0:
+            return 0
+        return max(min_each, (total_budget - per_item_overhead * count) // count)
+
     def _build_analysis_prompt(
         self, commit_metadata: Dict[str, Any], repo_context: Dict[str, Any]
     ) -> str:
-        """Build the user prompt containing all commit and repository data."""
-        
-        # Format commit info
+        """Build the user prompt containing all commit and repository data,
+        under a hard total-size budget (see _prompt_char_budget)."""
+
+        char_budget = self._prompt_char_budget(self._build_system_prompt())
+
+        # Fixed shares of the dynamic-content budget. The commit's own diff
+        # is what actually needs reviewing, so it gets the majority; repo
+        # context is supporting material and can be squeezed harder.
+        diff_budget     = int(char_budget * 0.55)
+        keyfiles_budget = int(char_budget * 0.20)
+        readme_budget   = int(char_budget * 0.10)
+        tree_budget     = int(char_budget * 0.10)
+
+        # Format commit info — per-file patch allowance shrinks as the
+        # number of changed files grows, instead of a flat 2000 chars/file
+        # that made large commits balloon without limit.
+        files = commit_metadata.get("files", [])
+        per_file_patch_cap = self._split_budget(
+            len(files), diff_budget, per_item_overhead=120, min_each=150
+        )
         files_info = []
-        for f in commit_metadata.get("files", []):
+        for f in files:
             file_entry = (
                 f"File: {f['filename']} | Status: {f['status']} | "
                 f"+{f['additions']}/-{f['deletions']} lines"
             )
-            if f.get("patch"):
-                patch = f["patch"][:2000]  # Limit patch size per file
-                if len(f["patch"]) > 2000:
-                    patch += "\n... [truncated]"
-                file_entry += f"\n```diff\n{patch}\n```"
+            patch = f.get("patch") or ""
+            if patch:
+                snippet = patch[:per_file_patch_cap]
+                if len(patch) > per_file_patch_cap:
+                    snippet += "\n... [truncated]"
+                file_entry += f"\n```diff\n{snippet}\n```"
             files_info.append(file_entry)
+        files_block = "\n\n".join(files_info) if files_info else "No file details available."
+        # Belt-and-suspenders: the per-file math above should already keep
+        # this under diff_budget, but clip the assembled section too so a
+        # rounding/overhead edge case can never slip through.
+        if len(files_block) > diff_budget:
+            files_block = files_block[:diff_budget] + "\n... [truncated]"
 
-        # Format repo context
+        # Format repo context — same even-split treatment for key files.
+        key_files = repo_context.get("files", [])[:10]  # Top 10 most relevant files
+        per_key_file_cap = self._split_budget(
+            len(key_files), keyfiles_budget, per_item_overhead=40, min_each=150
+        )
         key_files_info = []
-        for file_data in repo_context.get("files", [])[:10]:  # Top 10 most relevant files
-            content_preview = file_data.get("content", "")[:1500]
-            if len(file_data.get("content", "")) > 1500:
+        for file_data in key_files:
+            content = file_data.get("content", "")
+            content_preview = content[:per_key_file_cap]
+            if len(content) > per_key_file_cap:
                 content_preview += "\n... [truncated]"
             key_files_info.append(
                 f"=== {file_data['path']} ===\n{content_preview}"
             )
+        key_files_block = "\n\n".join(key_files_info) if key_files_info else "No key files fetched."
+
+        readme = repo_context.get("readme") or "No README available."
+        if len(readme) > readme_budget:
+            readme = readme[:readme_budget] + "\n... [truncated]"
+
+        tree_lines = repo_context.get("tree", [])[:100]
+        tree_block = "\n".join(tree_lines)
+        if len(tree_block) > tree_budget:
+            tree_block = tree_block[:tree_budget] + "\n... [truncated]"
 
         prompt = textwrap.dedent(f"""\
             # COMMIT ANALYSIS REQUEST
@@ -276,8 +360,8 @@ class AIService:
             - Total Changes: +{commit_metadata.get('stats', {}).get('additions', 0)} / -{commit_metadata.get('stats', {}).get('deletions', 0)} lines
             - URL: {commit_metadata.get('url', 'N/A')}
 
-            ## CHANGED FILES ({len(commit_metadata.get('files', []))} files)
-            {"\n\n".join(files_info) if files_info else "No file details available."}
+            ## CHANGED FILES ({len(files)} files)
+            {files_block}
 
             ## PROJECT CONTEXT
             - Repository: {repo_context.get('repository', 'N/A')}
@@ -288,13 +372,13 @@ class AIService:
             - Visibility: {repo_context.get('visibility', 'N/A')}
 
             ## PROJECT FILE TREE ({len(repo_context.get('tree', []))} files)
-            {"\n".join(repo_context.get('tree', [])[:100])}
+            {tree_block}
 
             ## KEY PROJECT FILES
-            {"\n\n".join(key_files_info) if key_files_info else "No key files fetched."}
+            {key_files_block}
 
             ## README
-            {repo_context.get('readme') or 'No README available.'}
+            {readme}
 
             ---
 
@@ -302,6 +386,12 @@ class AIService:
             Consider the commit's changes in relation to the existing codebase.
             Respond ONLY with the JSON format specified in your instructions.
         """)
+
+        estimated_tokens = len(prompt) / self.CHARS_PER_TOKEN
+        logger.info(
+            "Built analysis prompt for %s — %d chars (~%d est. tokens, budget was ~%d chars)",
+            commit_metadata.get("sha", "?")[:7], len(prompt), estimated_tokens, char_budget,
+        )
 
         return prompt
 

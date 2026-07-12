@@ -153,6 +153,13 @@ class Config:
     groq_model:       str   = field(default_factory=lambda: _get_env("GROQ_MODEL", default="llama-3.3-70b-versatile"))
     groq_max_tokens:  int   = field(default_factory=lambda: int(_get_env("GROQ_MAX_TOKENS", default="4096")))
     groq_temperature: float = field(default_factory=lambda: float(_get_env("GROQ_TEMPERATURE", default="0.3")))
+    # Fix: the account's Groq TPM (tokens-per-minute) cap — used to size the
+    # analysis prompt so a single request can never be rejected with
+    # HTTP 413 ("Request too large ... on tokens per minute"). Keep this in
+    # sync with whatever tier the configured key(s) are actually on; the
+    # default of 12000 matches the free/on-demand tier seen in production
+    # errors. Set GROQ_TPM_LIMIT higher if you upgrade to Dev Tier.
+    groq_tpm_limit:   int   = field(default_factory=lambda: int(_get_env("GROQ_TPM_LIMIT", default="12000")))
 
     # Public-facing URL so onboarding can print the correct webhook URL
     # NOTE: Render's `fromService` blueprint wiring only exposes the bare
