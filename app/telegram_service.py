@@ -15,18 +15,18 @@ import os
 import re
 import tempfile
 from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Dict, Optional
+from typing import Any, Dict, Optional
 
 import httpx
 from docx import Document
 from docx.shared import Pt, RGBColor, Inches
 from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-from ai_service import CommitDecision, ai_service
-from config import CONFIG, logger
-import database as db
-from http_utils import DEFAULT_LIMITS, DEFAULT_TIMEOUT, request_with_retry
-from exceptions import TelegramServiceError, TelegramAPIError  # noqa: F401 (Phase 4 shared hierarchy)
+from .ai_service import CommitDecision, ai_service
+from .config import CONFIG, logger
+from . import database as db
+from .http_utils import DEFAULT_LIMITS, DEFAULT_TIMEOUT, request_with_retry
+from .exceptions import TelegramServiceError, TelegramAPIError  # noqa: F401 (Phase 4 shared hierarchy)
 
 
 def _telegram_retry_after(response: httpx.Response) -> Optional[float]:
@@ -979,7 +979,7 @@ class TelegramService:
                 raise ValueError(f"Missing repo info in commit metadata: {repo_full!r}")
             owner, repo  = repo_full.split("/", 1)
             user         = await db.get_user(chat_id)
-            from github_service import GitHubService
+            from .github_service import GitHubService
             gh           = GitHubService(token=user["github_token"]) if user else None
             repo_context = await gh.fetch_repo_context(owner, repo) if gh else {}
             report_text  = await ai_service.generate_transparency_report(commit_metadata, repo_context, decision)
@@ -1031,7 +1031,7 @@ class TelegramService:
         )
 
         try:
-            from github_service import GitHubService
+            from .github_service import GitHubService
             gh = GitHubService(token=user["github_token"])
 
             await self.edit_message(chat_id, proc, "🔍 _Loading repository structure and key files…_")
@@ -1154,9 +1154,6 @@ class TelegramService:
     def _build_code_analysis_docx_sync(
         self, owner: str, repo: str, analysis: dict, reviews: list,
     ) -> str:
-        from docx.oxml.ns import qn
-        from docx.oxml import OxmlElement
-
         generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         BLUE      = RGBColor(0x1F, 0x49, 0x7D)

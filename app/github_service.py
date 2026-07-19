@@ -9,20 +9,19 @@ import asyncio
 import base64
 import hashlib
 import hmac
-import json
 import re
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 import httpx
 
-from config import CONFIG, logger
-from http_utils import DEFAULT_LIMITS, DEFAULT_TIMEOUT, request_with_retry
+from .config import CONFIG, logger
+from .http_utils import DEFAULT_LIMITS, DEFAULT_TIMEOUT, request_with_retry
 # Phase 4: exception classes now live in exceptions.py under a shared
 # GitGuardError base (structured `.category` / `.retryable`). Re-exported
 # here so every existing `from github_service import GitHubAPIError`-style
 # import elsewhere in the codebase keeps working unchanged.
-from exceptions import (  # noqa: F401
+from .exceptions import (  # noqa: F401
     GitHubServiceError,
     WebhookVerificationError,
     GitHubAPIError,

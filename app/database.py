@@ -34,8 +34,8 @@ from typing import Any, Dict, List, Optional
 
 import asyncpg
 
-from config import CONFIG
-from exceptions import DatabaseConnectionError, DatabaseError
+from .config import CONFIG
+from .exceptions import DatabaseConnectionError
 
 logger = logging.getLogger("commit_guardian.db")
 

@@ -104,7 +104,7 @@ Everything else has a sensible default — see [Configuration reference](#config
 ### 4. Run it
 
 ```bash
-uvicorn webhook_server:app --host 0.0.0.0 --port 8000
+uvicorn app.webhook_server:app --host 0.0.0.0 --port 8000
 ```
 
 GitGuard initializes the schema, registers itself with Telegram, and starts the job workers. Check `/health` — it round-trips a real query against the database, not just "did the process start."
@@ -227,7 +227,7 @@ Job failures retry up to `JOB_MAX_ATTEMPTS` times, then notify the user and coun
 
 **Safety Score (0-100)** is the one to trust: its band is locked to the risk level (`critical` 0-24, `high` 25-54, `medium` 55-79, `low` 80-100), so it can never contradict the label next to it — confidence only decides where in that band it lands.
 
-Before the score is computed, `risk_guardrails.py` scans the **raw diff** for security-critical paths, hardcoded credentials, disabled security controls, and structural corruption (unbalanced tags/brackets). These checks only push risk **up**, never down, and a `critical` finding forces the decision to `decline` regardless of the model's call. The same guardrails also scan whole files during Full Code Analysis, and report stats (commit counts, decline rates) are computed locally rather than trusted from the model.
+Before the score is computed, `app/risk_guardrails.py` scans the **raw diff** for security-critical paths, hardcoded credentials, disabled security controls, and structural corruption (unbalanced tags/brackets). These checks only push risk **up**, never down, and a `critical` finding forces the decision to `decline` regardless of the model's call. The same guardrails also scan whole files during Full Code Analysis, and report stats (commit counts, decline rates) are computed locally rather than trusted from the model.
 
 ---
 
@@ -236,9 +236,9 @@ Before the score is computed, `risk_guardrails.py` scans the **raw diff** for se
 - **Resilient HTTP** — GitHub/Groq/Telegram calls share one retry layer: 429/5xx/connection errors get exponential backoff with jitter, `Retry-After` is honored, permanent errors (404/401) are never retried.
 - **Groq key fallback** — a rate-limited key is skipped for the next one; the user only sees an error once every key fails.
 - **Crash-safe jobs** — analysis runs off a `jobs` table claimed atomically, so a crash mid-analysis resumes from the top on next startup instead of vanishing.
-- **Shared exception hierarchy** (`exceptions.py`) — every intentional error carries a `category` and `retryable` flag for consistent logging/retry decisions.
+- **Shared exception hierarchy** (`app/exceptions.py`) — every intentional error carries a `category` and `retryable` flag for consistent logging/retry decisions.
 - **Structured logging** — `LOG_FORMAT=json` for one JSON object per log line, machine-parseable.
-- **Admin alerting** (`alerting.py`) — pings `ADMIN_CHAT_ID` when a failure category repeats past threshold, with a cooldown so an outage doesn't spam the chat.
+- **Admin alerting** (`app/alerting.py`) — pings `ADMIN_CHAT_ID` when a failure category repeats past threshold, with a cooldown so an outage doesn't spam the chat.
 
 ---
 

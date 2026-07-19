@@ -19,7 +19,7 @@ from typing import List, Optional
 
 from dotenv import load_dotenv
 
-load_dotenv(dotenv_path=Path(__file__).parent / ".env")
+load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
 
 
 class _JsonFormatter(logging.Formatter):

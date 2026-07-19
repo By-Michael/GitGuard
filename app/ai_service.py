@@ -13,10 +13,10 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from config import CONFIG, logger
-from http_utils import DEFAULT_LIMITS, LONG_READ_TIMEOUT, request_with_retry
-from exceptions import AIServiceError, AIAnalysisError  # noqa: F401 (Phase 4 shared hierarchy)
-from risk_guardrails import scan_commit, scan_repo_files, risk_level_to_band, apply_guardrails
+from .config import CONFIG, logger
+from .http_utils import DEFAULT_LIMITS, LONG_READ_TIMEOUT, request_with_retry
+from .exceptions import AIServiceError, AIAnalysisError  # noqa: F401 (Phase 4 shared hierarchy)
+from .risk_guardrails import scan_repo_files, apply_guardrails
 
 
 @dataclass

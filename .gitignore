@@ -1,9 +1,6 @@
 # Credentials and Secrets
 .env
 
-# Dependencies
-node_modules/
-
 # Databases and Local State
 commit_guardian.db
 commit_guardian.db-shm
@@ -12,7 +9,7 @@ commit_guardian.db-wal
 # Python
 __pycache__/
 *.pyc
-
+node_modules/
 # Compressed archives
 *.zip
 *.rar

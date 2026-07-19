@@ -27,11 +27,11 @@ Design:
 
 import time
 from collections import defaultdict
-from typing import Deque, Dict, Optional
+from typing import Deque, Dict
 from collections import deque
 
-from config import CONFIG, logger
-from exceptions import GitGuardError
+from .config import CONFIG, logger
+from .exceptions import GitGuardError
 
 _failure_windows: Dict[str, Deque[float]] = defaultdict(deque)
 _last_alert_sent: Dict[str, float] = {}
@@ -86,7 +86,7 @@ async def record_failure(exc_or_category, detail: str = "") -> None:
     try:
         # Lazy import: avoids a circular import at module load time
         # (telegram_service imports config, not alerting).
-        from telegram_service import telegram_service
+        from .telegram_service import telegram_service
         await telegram_service.send_message(
             CONFIG.admin_chat_id,
             f"🚨 *GitGuard Admin Alert*\n\n"

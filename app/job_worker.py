@@ -33,10 +33,10 @@ import logging
 import traceback
 from typing import Any, Dict, List
 
-import alerting
-import database as db
-from config import CONFIG
-from exceptions import UnknownJobTypeError
+from . import alerting
+from . import database as db
+from .config import CONFIG
+from .exceptions import UnknownJobTypeError
 
 logger = logging.getLogger("commit_guardian.jobs")
 
@@ -135,7 +135,7 @@ async def _run_process_commit(payload: Dict[str, Any]) -> None:
     # workers), so importing webhook_server back at module load time here
     # would be circular. Importing inside the function defers it until
     # webhook_server has finished loading.
-    from webhook_server import _process_commit_inner
+    from .webhook_server import _process_commit_inner
 
     user = await db.get_user(payload["chat_id"])
     if not user or not user.get("github_token"):
@@ -153,7 +153,7 @@ async def _notify_job_permanently_failed(job_type: str, payload: Dict[str, Any],
     if job_type != "process_commit":
         return
     try:
-        from telegram_service import telegram_service
+        from .telegram_service import telegram_service
         sha = payload.get("commit_sha", "")[:7]
         await telegram_service.send_message(
             payload["chat_id"],

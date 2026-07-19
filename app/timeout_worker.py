@@ -13,8 +13,8 @@ import logging
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
-import database as db
-from ai_service import CommitDecision
+from . import database as db
+from .ai_service import CommitDecision
 
 logger = logging.getLogger("commit_guardian.timeout")
 
@@ -38,8 +38,8 @@ async def _check_and_act() -> None:
 
     logger.info("Found %d timed-out review(s)", len(stale))
 
-    from github_service import GitHubService
-    from telegram_service import telegram_service
+    from .github_service import GitHubService
+    from .telegram_service import telegram_service
 
     for review in stale:
         commit_sha    = review["commit_sha"]
@@ -121,7 +121,7 @@ async def _auto_decline(
     tg, gh, chat_id, message_id, commit_sha,
     commit_metadata, owner, repo, branch, timeout_hours,
 ) -> None:
-    from github_service import RollbackError
+    from .github_service import RollbackError
     sha_short = commit_sha[:7]
 
     proc = await tg.send_processing(
