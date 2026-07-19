@@ -1,6 +1,6 @@
 # GitGuard — AI-Powered Commit Review Bot
 
-**By [Michael](https://github.com/By-Michael)**
+**By-[Michael](https://github.com/By-Michael)**
 
 GitGuard is a self-hosted GitHub commit guardian that sends every push on your repository straight to your Telegram, lets an AI analyze the risk, and gives you a one-tap Accept or Rollback before the code ever becomes a problem.
 
