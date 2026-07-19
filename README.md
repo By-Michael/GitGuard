@@ -278,8 +278,9 @@ Built by **[Michael](https://github.com/By-Michael)**. Started as a small script
 Bug reports, ideas, or "why did you do it this way" questions — open an issue or ping me on GitHub.
 
 ---
-License
+## License
 
-PolyForm Noncommercial License 1.0.0 — Copyright © 2026 Michael Defaru.
+[PolyForm Noncommercial License 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) — Copyright © 2026 Michael Defaru.
 
-Free to use, modify, and share for any noncommercial purpose — personal projects, learning, research, portfolio review, nonprofits, education, and the like. Commercial use requires a separate license from the author. See LICENSE for the full terms.
+Free to use, modify, and share for any **noncommercial** purpose — personal projects, learning, research, portfolio review, nonprofits, education, and the like. Commercial use requires a separate license from the author. See [`LICENSE`](./LICENSE) for the full terms.
+
