@@ -1,5 +1,7 @@
 # GitGuard — AI-Powered Commit Review Bot
 
+**By [Michael](https://github.com/By-Michael)**
+
 GitGuard is a self-hosted GitHub commit guardian that sends every push on your repository straight to your Telegram, lets an AI analyze the risk, and gives you a one-tap Accept or Rollback before the code ever becomes a problem.
 
 No dashboards to open. No emails to ignore. Just a message in your pocket while you're having coffee.
@@ -10,33 +12,35 @@ No dashboards to open. No emails to ignore. Just a message in your pocket while 
 
 Every time someone pushes a commit to your watched branch, GitGuard:
 
-1. Catches the GitHub webhook and verifies it's legitimate
-2. Pulls the full diff and commit metadata from the GitHub API
-3. Grabs your repo's file tree and key files so the AI has real context
-4. Sends everything to **Llama 3.3 70B via Groq** for a risk assessment
-5. Sends you a Telegram message with the verdict — risk level, a plain-English summary, what looks good, what looks concerning, and a recommended action
-6. Waits for you to tap **✅ Accept**, **❌ Decline** (which triggers an automatic rollback), or **📊 Report** to get a full `.docx` analysis report
+1. Catches the GitHub webhook, verifies it's legitimate, and deduplicates it
+2. Queues the commit as a durable job (so a redeploy or crash mid-analysis doesn't lose it) instead of a fire-and-forget task
+3. Pulls the full diff and commit metadata from the GitHub API, plus repo file tree and key files for context
+4. Sends everything to **Llama 3.3 70B via Groq** for a risk assessment, backed by deterministic guardrail checks on the raw diff
+5. Sends you a Telegram message with the verdict — risk level, plain-English summary, concerns, positives, and a recommended action
+6. Waits for you to tap **✅ Accept**, **❌ Decline** (auto-rollback), or **📊 Report** for a full `.docx` analysis
 
-If you don't respond within your configured timeout, it automatically accepts or rolls back — your choice.
+If you don't respond within your timeout, it auto-accepts or auto-rolls-back — your choice. GitGuard also recognizes its own revert commits and skips reviewing them.
 
-It supports **multiple users** with completely isolated setups. Each person gets their own webhook URL, stores their own GitHub token, and watches their own repo. The server only needs three secrets.
+It supports **multiple users** with completely isolated setups — own webhook URL, own GitHub token, own repo per person. The server only needs a small set of shared secrets.
 
 ---
 
 ## Features
 
-- **AI risk scoring** — every commit gets a deterministic-anchored *safety score*, a risk level (low / medium / high / critical), a list of concerns, positive aspects, and specific recommendations, all generated with full awareness of your codebase. The safety score's band is locked to the risk level (see "How scoring works" below) and can be escalated — never softened — by pattern-based guardrail checks that run independently of the AI on the raw diff.
-- **One-tap rollback** — decline a commit and GitGuard immediately creates a safe revert commit on GitHub, or force-pushes the parent SHA if you prefer that approach
--**Full Code Analysis** — Trigger deep, multi-file code sweeps on-demand via the Telegram menu to identify architectural flaws, security vulnerabilities, and code debt outside of standard commit triggers
-- **Author Performance** — Track team contribution metrics with AI-driven summaries of commit quality, code stability, and review approval rates per author
-- **Active Reviews Dashboard** — View and manage all pending, flagged, or currently in-progress commit reviews directly from an interactive Telegram inline menu
-- **Commit History Log** — Access an organized, historical archive of past repo commits
-- **Configurable auto-timeout** — set how many hours you want before GitGuard takes action on its own, and whether that action should be accept or rollback
-- **Multi-user, zero config sharing** — every user onboards through the Telegram bot and stores their own credentials; the server never shares tokens between accounts
-- **Downloadable reports** — tap the Report button to get a formatted `.docx` file with the full AI analysis, commit details, author info, and recommendations
-- **Race condition safe** — per-commit asyncio locks make sure a double-tap never triggers two rollbacks
-- **Auto-registers its own webhook** — on every startup, GitGuard re-registers itself with Telegram so it survives redeployments without manual intervention
-- **Graceful shutdown** — in-flight commit tasks are drained before exit so no commit is left hanging
+- **AI risk scoring** — safety score (0-100) locked to a risk level (low/medium/high/critical), plus concerns, positives, and recommendations. Pattern-based guardrails on the raw diff can escalate risk (never soften it) — a `critical` finding forces `decline` outright, regardless of what the model said.
+- **One-tap rollback** — `revert` (safe, auditable) or `force_push` (rewrites history), your choice
+- **Full Code Analysis** — on-demand, multi-file AI sweep for architectural flaws, security issues, and code debt, with the same secret-detection guardrails applied to whole files
+- **Author Performance** — per-developer commit quality and approval-rate reports; numeric stats are computed from the database, not trusted from the model's own math
+- **Active Reviews Dashboard**, **Commit History Log**, **configurable auto-timeout**
+- **Token reconnect flow** — `/reconnect` swaps an expired GitHub token without wiping your repo/branch/timeout settings
+- **Downloadable `.docx` reports** for any review
+- **Crash-safe job queue** — commit analysis runs off a durable `jobs` table instead of a bare `asyncio.create_task`
+- **Groq API key fallback** — configure multiple keys; GitGuard tries each in order before surfacing an error
+- **Resilient outbound HTTP** — shared retry/backoff layer (with `Retry-After` support) for GitHub, Groq, and Telegram calls
+- **Per-push and per-user caps** — big pushes cap to the head commit; each user caps at 5 pending reviews
+- **Race-condition safe** — atomic dedup + per-commit locks prevent double reviews/rollbacks
+- **Auto-registers its own webhook** on every startup; **graceful shutdown** drains in-flight jobs
+- **Admin alerting** on repeated failures, with optional structured JSON logging
 
 ---
 
@@ -45,9 +49,9 @@ It supports **multiple users** with completely isolated setups. Each person gets
 | Layer | What's used |
 |---|---|
 | Web server | FastAPI + Uvicorn |
-| AI analysis | Groq API — Llama 3.3 70B Versatile |
-| Database | SQLite (WAL mode, thread-local connections) |
-| HTTP client | httpx (async) |
+| AI analysis | Groq API — Llama 3.3 70B Versatile, with multi-key fallback |
+| Database | Postgres (via `asyncpg`, connection-pooled) |
+| HTTP client | httpx (async), shared retry/backoff layer |
 | Report generation | python-docx |
 | Notifications | Telegram Bot API |
 | Config | python-dotenv |
@@ -59,6 +63,7 @@ It supports **multiple users** with completely isolated setups. Each person gets
 ### Prerequisites
 
 - Python 3.10+
+- A Postgres database (Docker for dev, any managed provider for prod)
 - A publicly reachable server URL (Render, Railway, a VPS, etc.)
 - A Telegram bot token from [@BotFather](https://t.me/BotFather)
 - A [Groq API key](https://console.groq.com)
@@ -71,77 +76,107 @@ cd gitguard
 pip install -r requirements.txt
 ```
 
-### 2. Configure environment
+### 2. Start a local database
 
-Copy the example file and fill in your three required secrets:
+```bash
+docker compose up -d
+```
+
+Spins up a throwaway Postgres container (`postgresql://gitguard:gitguard@localhost:5432/gitguard`). Don't use this in production — see [Deploying to Render](#deploying-to-render).
+
+### 3. Configure environment
 
 ```bash
 cp .env.example .env
 ```
 
-Open `.env` and set at minimum:
+Set at minimum:
 
 ```env
 TELEGRAM_BOT_TOKEN=your_bot_token_here
 GROQ_API_KEY=your_groq_api_key_here
 PUBLIC_URL=https://your-server-url.com
+DATABASE_URL=postgresql://gitguard:gitguard@localhost:5432/gitguard
 ```
 
-Everything else has a sensible default. See the [Configuration reference](#configuration-reference) below for the full list.
+Everything else has a sensible default — see [Configuration reference](#configuration-reference).
 
-### 3. Run it
+### 4. Run it
 
 ```bash
 uvicorn webhook_server:app --host 0.0.0.0 --port 8000
 ```
 
-On startup, GitGuard initialises the SQLite database, registers itself with Telegram, and starts the background timeout worker. You'll see a log line confirming everything is live.
+GitGuard initializes the schema, registers itself with Telegram, and starts the job workers. Check `/health` — it round-trips a real query against the database, not just "did the process start."
 
-### 4. Onboard via Telegram
+### 5. Onboard via Telegram
 
-Open Telegram, find your bot, and send `/start`. The bot walks you through five steps:
+Send `/start` to your bot and follow the 5-step wizard: repo (`owner/repo`), branch, a GitHub PAT with `repo` scope, timeout hours, and timeout action. You'll get your personal webhook URL at the end. (If you have pending reviews and re-run `/start`, GitGuard warns you first — it'll clear your token.)
 
-1. Your repository in `owner/repo` format
-2. The branch to watch (e.g. `main`)
-3. A GitHub personal access token with `repo` scope
-4. How many hours before a review times out (0 to disable)
-5. What to do on timeout — auto-accept or auto-rollback
+### 6. Add the webhook to GitHub
 
-Once onboarding is complete, the bot shows you your personal webhook URL.
+**Settings → Webhooks → Add webhook**:
 
-### 5. Add the webhook to GitHub
-
-Go to your repository → **Settings → Webhooks → Add webhook** and fill in:
-
-- **Payload URL**: the URL the bot just gave you (looks like `https://your-server.com/webhook/github/YOUR_CHAT_ID`)
+- **Payload URL**: the URL the bot gave you (`https://your-server.com/webhook/github/YOUR_CHAT_ID`)
 - **Content type**: `application/json`
-- **Secret**: the webhook secret the bot generated for you (you can retrieve it anytime with `/settings`)
-- **Events**: just push events is enough
+- **Secret**: from `/settings`
+- **Events**: just push events
 
-That's it. Push a commit and watch your Telegram.
+Push a commit and watch your Telegram.
 
 ---
 
 ## Configuration reference
 
-All of these can be set in your `.env` file. Only the top three are required — the rest have defaults.
+Only the top four are required — everything else has a default.
 
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `TELEGRAM_BOT_TOKEN` | ✅ | — | Your Telegram bot token from @BotFather |
-| `GROQ_API_KEY` | ✅ | — | Your Groq API key for Llama access |
-| `PUBLIC_URL` | ✅ | — | The public URL of your server, used to build webhook URLs shown to users during onboarding |
-| `GROQ_MODEL` | | `llama-3.3-70b-versatile` | The Groq model to use for analysis |
-| `GROQ_MAX_TOKENS` | | `4096` | Max tokens in the AI response |
-| `GROQ_TEMPERATURE` | | `0.3` | Sampling temperature — lower means more consistent decisions |
-| `SERVER_HOST` | | `0.0.0.0` | Host to bind the FastAPI server to |
-| `SERVER_PORT` | | `8000` | Port to listen on |
-| `ROLLBACK_STRATEGY` | | `revert` | How to undo a commit — `revert` creates a safe revert commit, `force_push` rewrites history (destructive) |
-| `MAX_CONTEXT_FILES` | | `50` | Max number of repo files sent to the AI for context |
-| `MAX_FILE_SIZE_BYTES` | | `50000` | Max size of any individual file sent to the AI |
-| `EXCLUDED_PATTERNS` | | *(see below)* | Comma-separated list of paths and patterns to exclude from AI context |
+### Required
 
-**Default excluded patterns:** `.git`, `node_modules`, `__pycache__`, `.venv`, `*.lock`, `*.min.js`, `*.min.css`, `build`, `dist`, and common binary/media extensions like `.png`, `.jpg`, `.mp4`, `.pdf`, `.zip`.
+| Variable | Description |
+|---|---|
+| `TELEGRAM_BOT_TOKEN` | Your Telegram bot token from @BotFather |
+| `GROQ_API_KEY` | Your primary Groq API key |
+| `PUBLIC_URL` | Public server URL used to build webhook links (bare hostname accepted, `https://` assumed) |
+| `DATABASE_URL` | Postgres connection string, passed to `asyncpg` as-is |
+
+### Groq / AI
+
+| Variable | Default | Description |
+|---|---|---|
+| `GROQ_MODEL` | `llama-3.3-70b-versatile` | Model used for analysis |
+| `GROQ_MAX_TOKENS` | `4096` | Max tokens in the AI response |
+| `GROQ_TEMPERATURE` | `0.3` | Lower = more consistent |
+| `GROQ_TPM_LIMIT` | `12000` | Your account's tokens-per-minute cap, used to size prompts and avoid HTTP 413 |
+| `GROQ_API_KEYS` / `GROQ_API_KEY_2`, `_3`... | — | Extra keys to fall back to on rate limit/failure |
+
+### Server & analysis
+
+| Variable | Default | Description |
+|---|---|---|
+| `SERVER_HOST` / `SERVER_PORT` | `0.0.0.0` / `8000` | Bind address |
+| `ROLLBACK_STRATEGY` | `revert` | `revert` (safe) or `force_push` (destructive) |
+| `MAX_CONTEXT_FILES` | `50` | Max repo files sent to the AI |
+| `MAX_FILE_SIZE_BYTES` | `50000` | Max size per file sent to the AI |
+| `EXCLUDED_PATTERNS` | *(see `.env.example`)* | Paths/patterns excluded from AI context |
+| `TELEGRAM_WEBHOOK_SECRET` | — | Verifies updates actually came from Telegram |
+
+### Database & jobs
+
+| Variable | Default | Description |
+|---|---|---|
+| `DB_POOL_MIN` / `DB_POOL_MAX` | `2` / `10` | Pooled connection range |
+| `DB_COMMAND_TIMEOUT_SECONDS` / `DB_CONNECT_TIMEOUT_SECONDS` | `10` / `10` | Query / connect timeouts |
+| `JOB_POLL_INTERVAL_SECONDS` | `3` | How often idle workers poll for jobs |
+| `JOB_WORKER_COUNT` | `3` | Concurrent in-process job workers |
+| `JOB_MAX_ATTEMPTS` | `3` | Retries before a job is marked failed |
+
+### Logging & admin alerting
+
+| Variable | Default | Description |
+|---|---|---|
+| `LOG_FORMAT` | `text` | `json` for structured logs (recommended in prod) |
+| `ADMIN_CHAT_ID` | — | Chat that gets alerted on repeated failures (unset = just logs a warning) |
+| `ALERT_FAILURE_THRESHOLD` / `ALERT_WINDOW_SECONDS` / `ALERT_COOLDOWN_SECONDS` | `5` / `600` / `1800` | When an alert fires and how often |
 
 ---
 
@@ -149,112 +184,98 @@ All of these can be set in your `.env` file. Only the top three are required —
 
 | Command | What it does |
 |---|---|
-| `/start` | Starts the onboarding wizard or reconnects an existing account |
-| `/status` | Shows your current setup — repo, branch, active reviews |
-| `/settings` | Displays your webhook URL and webhook secret |
-| `/help` | Lists all available commands with brief descriptions |
+| `/start` | Onboarding wizard, or reconfigure (warns if you have pending reviews) |
+| `/reconnect` | Refresh an expired GitHub token, keeping repo/branch/timeout settings |
+| `/status` | Repo, branch, timeout, and pending reviews |
+| `/settings` | Your webhook URL and secret |
+| `/menu` / `/hidemenu` | Show or hide the reply-keyboard menu |
+| `/cancel` / `/stop` | Escape hatch during onboarding |
+| `/help` | Full command and menu reference |
+
+**Menu buttons:** 👤 My Profile · 📜 Commit History · 📊 Active Reviews · ⚙️ Settings · 🔍 Full Code Analysis · 👥 Author Performance · 📞 Contact Support · 🙈 Hide Menu
 
 ---
 
 ## How the review flow works
 
 ```
-GitHub push event
+GitHub push → verify signature → filter to watched branch → dedupe → cap checks
        │
        ▼
-POST /webhook/github/{chat_id}
-  └─ Verify HMAC signature
-  └─ Deduplicate (skip if SHA already in DB)
+Row inserted into `jobs` table (survives a crash/redeploy)
        │
        ▼
-Background task spawned
-  └─ Fetch commit metadata + diff (GitHub API)
-  └─ Fetch repo context (file tree + key files)
-  └─ Send to Groq Llama for risk analysis
-  └─ Save review to SQLite
+Job worker claims it (FOR UPDATE SKIP LOCKED) and runs the pipeline:
+  fetch commit + diff → skip if it's GitGuard's own revert → fetch repo context
+  → Groq risk analysis (with key fallback) → guardrail checks escalate/force-decline
+  → save review to Postgres
        │
        ▼
-Telegram message sent to user
-  ├─ Risk level + confidence score
-  ├─ Summary and reasoning
-  ├─ Concerns and positive aspects
-  └─ Inline buttons: ✅ Accept | ❌ Decline | 📊 Report
-
-User taps a button
-  ├─ Accept → resolves review, keeps commit
-  ├─ Decline → rollback commit on GitHub → notify result
-  └─ Report → generate + send .docx analysis file
-
-No response within timeout_hours
-  └─ Timeout worker auto-accepts or auto-declines
+Telegram review card sent: risk level, summary, concerns, ✅ Accept | ❌ Decline | 📊 Report
+       │
+       ▼
+User taps a button, or the timeout worker auto-acts if they don't
 ```
+
+Job failures retry up to `JOB_MAX_ATTEMPTS` times, then notify the user and count toward admin alerting.
 
 ---
 
 ## How scoring works
 
-Two numbers appear on every review card, and they mean different things:
+**AI Confidence** and **Safety Score** are different numbers. Confidence is how sure the model is in its own verdict — showing that alone used to produce misleading reads (a tiny diff that corrupts a `<?php` tag could score ~80/100 because the model was "confident" it was harmless).
 
-- **AI Confidence** — how confident the model is in *its own verdict*. This alone used to be shown as if it were a safety score, which is what caused misleading reads (e.g. a one-character change that corrupts a `<?php` tag being scored ~80/100 because the model was confident the tiny diff was harmless).
-- **Safety Score (0-100)** — the number to actually trust. Its band is locked to the risk level (`critical` → 0-24, `high` → 25-54, `medium` → 55-79, `low` → 80-100), so it can never contradict the risk label next to it. Confidence only decides where in that band it lands.
+**Safety Score (0-100)** is the one to trust: its band is locked to the risk level (`critical` 0-24, `high` 25-54, `medium` 55-79, `low` 80-100), so it can never contradict the label next to it — confidence only decides where in that band it lands.
 
-Before the AI-produced risk level is used, `risk_guardrails.py` runs deterministic pattern checks against the **raw diff** (not a summary of it): security-critical paths (`.github/workflows/`, auth, secrets, migrations, `Dockerfile`, `.env`), hardcoded-credential patterns, security controls being disabled (`verify=False`, `DEBUG=True`, etc.), and structural corruption signals (e.g. a removed `<?php`/`?>` tag, or an unbalanced bracket delta within the visible diff). These checks can only push risk **up** and force a `decline`, never soften what the model said — a false positive here just adds an extra concern for you to read; a false negative from the model gets caught.
-
-The same guardrail module also runs against whole-file contents during **Full Code Analysis** (flagging any committed secret regardless of what the model notices in a truncated preview) and the numeric fields in both **Full Code Analysis** and **Author Analysis** reports (commit counts, decline rates, etc.) are computed locally from the database and overwritten onto the AI's response rather than trusted from the model's own restatement of the same numbers — this avoids miscounts once there's more than a handful of commits/authors in the prompt.
+Before the score is computed, `risk_guardrails.py` scans the **raw diff** for security-critical paths, hardcoded credentials, disabled security controls, and structural corruption (unbalanced tags/brackets). These checks only push risk **up**, never down, and a `critical` finding forces the decision to `decline` regardless of the model's call. The same guardrails also scan whole files during Full Code Analysis, and report stats (commit counts, decline rates) are computed locally rather than trusted from the model.
 
 ---
 
-## Reliability (Phase 4)
+## Reliability
 
-- **Shared exception hierarchy** (`exceptions.py`) — every exception the app raises on purpose (GitHub/AI/Telegram/database/job failures) inherits from `GitGuardError`, carrying a `category` (github/ai/telegram/database/jobs) and `retryable` flag, instead of being ad-hoc per module.
-- **Structured logging** — set `LOG_FORMAT=json` (the Render blueprint below does this) to emit one JSON object per log line, including the failure `category` when the active exception is a `GitGuardError`. Leave unset for the original human-readable format during local dev.
-- **Admin alerting on repeated failures** (`alerting.py`) — separate from the existing per-user "your commit failed" notice, this watches for a *pattern* (e.g. Groq or GitHub being down for everyone) and pings `ADMIN_CHAT_ID` once a failure category crosses `ALERT_FAILURE_THRESHOLD` within `ALERT_WINDOW_SECONDS`, then goes quiet for `ALERT_COOLDOWN_SECONDS` so a sustained outage doesn't spam the chat. Unset `ADMIN_CHAT_ID` disables sending (a warning is logged instead).
+- **Resilient HTTP** — GitHub/Groq/Telegram calls share one retry layer: 429/5xx/connection errors get exponential backoff with jitter, `Retry-After` is honored, permanent errors (404/401) are never retried.
+- **Groq key fallback** — a rate-limited key is skipped for the next one; the user only sees an error once every key fails.
+- **Crash-safe jobs** — analysis runs off a `jobs` table claimed atomically, so a crash mid-analysis resumes from the top on next startup instead of vanishing.
+- **Shared exception hierarchy** (`exceptions.py`) — every intentional error carries a `category` and `retryable` flag for consistent logging/retry decisions.
+- **Structured logging** — `LOG_FORMAT=json` for one JSON object per log line, machine-parseable.
+- **Admin alerting** (`alerting.py`) — pings `ADMIN_CHAT_ID` when a failure category repeats past threshold, with a cooldown so an outage doesn't spam the chat.
 
 ---
 
 ## Database
 
-GitGuard uses Postgres (via `asyncpg`, connection-pooled) — a `DATABASE_URL` is required. Two main tables:
-
-- **`users`** — one row per Telegram user: GitHub token, webhook secret, repo, branch, timeout preferences, onboarding state.
-- **`active_reviews`** — one row per commit currently under review, storing commit metadata and the AI decision as JSON.
-- **`jobs`** — the crash-safe queue (Phase 3) that commit processing runs off, so an in-flight analysis survives a restart/redeploy.
-
-For local development, `docker-compose up -d` spins up a throwaway Postgres — see `docker-compose.yml`.
+Postgres via `asyncpg`, connection-pooled. Four tables: `users` (credentials, repo, timeout prefs), `active_reviews` (commit + AI decision JSON), `queued_shas` (atomic dedup gate), `jobs` (crash-safe queue). `docker-compose up -d` gives you a throwaway local instance.
 
 ---
 
 ## Deploying to Render
 
-The included `render.yaml` blueprint (Phase 5) wires this up for you in one step:
+`render.yaml` targets Render's **free** web-service tier. Push your repo, then **New +** → **Blueprint** in the Render dashboard.
 
-1. Push your code to a GitHub repo
-2. In the Render dashboard: **New +** → **Blueprint**, point it at your repo
-3. Render provisions a `starter`-plan web service and a `basic-256mb`-plan Postgres instance, and wires `DATABASE_URL` and `PUBLIC_URL` between them automatically
-4. Set the two secrets Render will prompt you for: `TELEGRAM_BOT_TOKEN` and `GROQ_API_KEY`
-5. (Optional) Set `ADMIN_CHAT_ID` to your own Telegram chat_id to receive admin alerts on repeated failures
-6. Deploy
+Render no longer has a free managed-Postgres tier, so this blueprint doesn't provision a database — you'll need to:
 
-**Note on cost:** the free web-service tier spins down on idle, which breaks the timeout worker and job workers (they need the process to stay running between webhook events) — this is why the blueprint uses the `starter` (always-on) compute plan. There's no free managed-Postgres tier on Render anymore either; `basic-256mb` is the cheapest paid tier that works here.
+1. Provision Postgres on a free external provider (Neon, Supabase, Aiven, etc.)
+2. Set `DATABASE_URL` to that connection string (usually needs `?sslmode=require`)
+3. Set `TELEGRAM_BOT_TOKEN` and `GROQ_API_KEY`
+4. Optionally set `ADMIN_CHAT_ID` for admin alerts
 
-If you'd rather set this up manually instead of using the blueprint, the manual steps are the same as above minus the one-click provisioning — create the web service and Postgres instance separately in the dashboard and copy the connection string into `DATABASE_URL` yourself.
+`PUBLIC_URL` is wired automatically from Render's hostname.
 
----
-
-## A note on the rollback strategies
-
-**`revert` (default):** Creates a new commit that undoes the changes of the declined commit. This is the safe option — it preserves full history and is easy to audit. GitHub shows both the original commit and the revert, which keeps things transparent.
-
-**`force_push`:** Removes the declined commit from the branch's history entirely by force-pushing the parent SHA. This is cleaner-looking but it rewrites history, which can cause problems for anyone who already pulled the branch. Only use this if you know what you're doing and your team is aware.
+**Cost note:** the free plan spins down after ~15 min idle, which pauses the timeout/job workers until the next request wakes it up. For on-time timeouts, ping `/health` periodically.
 
 ---
 
-## License
+## A note on rollback strategies
 
-Copyright © 2026 Michael Defaru. All rights reserved.
+**`revert` (default):** creates an undo commit — safe, auditable, preserves history. **`force_push`:** removes the commit entirely by rewriting history — cleaner-looking but can break anyone who already pulled the branch. Only use this if your team knows what's happening.
 
-This project is proprietary and closed-source. It is shared publicly strictly for portfolio review and educational evaluation.
+---
 
-Permissions: Recruiters, hiring managers, and engineers are authorized to view, clone, and test this repository locally for the sole purpose of evaluating my candidacy for employment.
+## Author
 
-Restrictions: Any other use—including commercial deployment, modification, or unauthorized public distribution—is strictly prohibited.
+Built by **[Michael](https://github.com/By-Michael)**. Started as a small script and just kept growing  one feature led to another until it turned into an actual multi-user service with a job queue, retries, and all the reliability stuff that wasn't part of the original plan.
+
+Bug reports, ideas, or "why did you do it this way" questions — open an issue or ping me on GitHub.
+
+---
+
